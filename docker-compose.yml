@@ -1,0 +1,184 @@
+# ─────────────────────────────────────────────────────────────
+# CSVForge — local development environment
+#
+# WHAT:
+#   Docker Compose orchestrates multiple containers as a single application.
+#   This file defines two services: a PostgreSQL database and the FastAPI API.
+#
+# WHY DOCKER COMPOSE?
+#   Without Compose, you'd run two separate `docker run` commands, manually
+#   create a network, manage container lifecycle separately, and handle
+#   startup ordering yourself. Compose handles all of this declaratively.
+#
+# WHAT COMPOSE PROVIDES:
+#   - Networking: every service can reach others by service name (not IP)
+#   - Dependency ordering: `depends_on` ensures postgres starts before api
+#   - Volume management: named volumes for persistent data
+#   - Single command lifecycle: `docker compose up` starts everything
+#
+# DOCKER INTERNAL DNS (WHY service names work as hostnames):
+#   Compose creates a private virtual network for all services in this file.
+#   Each service gets a DNS entry: the service name resolves to the container's
+#   IP address on this internal network.
+#   So DATABASE_URL uses `@postgres:5432` (not `@localhost:5432`) —
+#   `postgres` is the service name, and Docker resolves it to the correct IP.
+#   localhost inside the api container refers to the api container itself,
+#   not the postgres container.
+#
+# USAGE:
+#   docker compose up -d          start in background
+#   docker compose up             start in foreground (see logs)
+#   docker compose down           stop and remove containers
+#   docker compose down -v        stop, remove containers AND the data volume
+#   docker compose logs -f api    follow API logs
+# ─────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────
+  # The relational database. Matches the PostgreSQL 16 version used in
+  # production (RDS) to catch any version-specific behavior early.
+  postgres:
+    image: postgres:16
+    container_name: csvforge-postgres
+
+    # restart: unless-stopped — automatically restart the container if it
+    # crashes or if Docker daemon restarts (e.g., after a reboot).
+    # "unless-stopped" means: restart always EXCEPT when you explicitly
+    # ran `docker compose stop` or `docker compose down`.
+    # Other options: "no" (never restart), "always" (even if manually stopped),
+    # "on-failure" (only on non-zero exit code).
+    restart: unless-stopped
+
+    environment:
+      # These three variables initialize the PostgreSQL instance on FIRST START.
+      # When the postgres_data volume is empty (first run or after `down -v`),
+      # the PostgreSQL container init scripts read these variables to:
+      #   1. Create a database superuser with POSTGRES_USER / POSTGRES_PASSWORD
+      #   2. Create a database named POSTGRES_DB
+      # On subsequent starts (when the volume already has data), these
+      # variables are ignored — the database is already initialized.
+      #
+      # TO RESET (start fresh): run `docker compose down -v` which removes
+      # the named volume, then `docker compose up`. On next start the volume
+      # is empty and the init scripts run again with these credentials.
+      POSTGRES_USER: csvforge
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: csvforge
+
+    ports:
+      # Expose PostgreSQL to the host machine so you can connect with psql,
+      # TablePlus, pgAdmin, or other database GUI tools from outside Docker.
+      # Format: "host_port:container_port"
+      # host:5432 → container:5432
+      # The api service connects via the internal Docker network (service name),
+      # not this host port mapping.
+      - "5432:5432"
+
+    volumes:
+      # Named volume: Docker manages the storage location on the host.
+      # Data persists across `docker compose down` (containers are removed).
+      # Data is only wiped by `docker compose down -v` (volumes are removed too).
+      #
+      # WHY named volume vs bind mount for the database?
+      #   A bind mount (./data:/var/lib/postgresql/data) would put the raw
+      #   PostgreSQL data files in your project directory. PostgreSQL data files
+      #   have complex binary formats and ownership requirements — they should
+      #   not be accessed by the host OS directly. Named volumes are managed
+      #   by Docker and have correct permissions and isolation.
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      # pg_isready is a PostgreSQL utility that checks whether the server is
+      # ready to accept connections. It exits 0 (success) when ready,
+      # non-zero when not ready.
+      #
+      # WHY IS THIS CRITICAL?
+      #   Without a healthcheck, `depends_on: postgres` in the api service
+      #   would only wait for the container to START — not for PostgreSQL
+      #   to be READY. PostgreSQL takes 1-3 seconds to initialize after the
+      #   container starts. If the api service starts during that window and
+      #   tries to connect, it fails with "connection refused."
+      #
+      # The api service uses `condition: service_healthy` which blocks until
+      # this healthcheck returns success. This prevents the race condition.
+      #
+      # interval: check every 5 seconds
+      # timeout: give pg_isready 5 seconds to respond before marking as failed
+      # retries: 10 failed checks before marking the service as unhealthy
+      # start_period: give the container 10 seconds to start before
+      #               counting failed checks (avoids false negatives on slow machines)
+      test: ["CMD-SHELL", "pg_isready -U csvforge -d csvforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── FastAPI API ─────────────────────────────────────────────
+  # The FastAPI application running under Uvicorn with hot-reload.
+  api:
+    build:
+      # context: the directory sent to Docker as the build context.
+      # All paths in the Dockerfile are relative to this directory.
+      # '.' = the project root (where this docker-compose.yml lives).
+      context: .
+      dockerfile: Dockerfile
+    container_name: csvforge-api
+    restart: unless-stopped
+
+    environment:
+      # ENVIRONMENT=local tells connection.py to read DATABASE_URL directly
+      # from the environment (no AWS Secrets Manager call).
+      # In production (Lambda), ENVIRONMENT=production triggers the Secrets
+      # Manager credential fetch. See backend/db/connection.py.
+      ENVIRONMENT: local
+
+      # DATABASE_URL uses the service name `postgres` as the hostname.
+      # Docker's internal DNS resolves `postgres` → the postgres container's IP.
+      # This is why we use `@postgres:5432` and NOT `@localhost:5432`.
+      # localhost inside the api container refers to the api container itself.
+      #
+      # `postgresql+psycopg://` is the SQLAlchemy dialect string for psycopg 3.
+      # (`postgresql+psycopg2://` would be psycopg 2 — a different driver.)
+      # Credentials must match POSTGRES_USER / POSTGRES_PASSWORD above.
+      DATABASE_URL: postgresql+psycopg://csvforge:password@postgres:5432/csvforge
+
+    ports:
+      # Expose the API to the host machine on port 8000.
+      # http://localhost:8000 and http://localhost:8000/docs from your browser.
+      - "8000:8000"
+
+    volumes:
+      # Bind mount: the host's ./backend directory is mounted at /app/backend
+      # inside the container. Any file you edit on the host is immediately
+      # visible inside the container.
+      #
+      # WHY? Uvicorn runs with --reload, which watches for file changes.
+      # When you edit a .py file on the host, the bind mount reflects the
+      # change inside the container, uvicorn detects it, and restarts the
+      # app — without rebuilding the Docker image.
+      #
+      # This is the hot-reload mechanism for local development.
+      - ./backend:/app/backend
+
+    depends_on:
+      postgres:
+        # condition: service_healthy blocks the api service from starting
+        # until the postgres healthcheck (pg_isready) returns success.
+        # This prevents the api from attempting a database connection before
+        # PostgreSQL is ready to accept one.
+        #
+        # Without this:
+        #   api starts → tries to connect to PostgreSQL → connection refused
+        #   → application crash on startup
+        #
+        # With this:
+        #   postgres healthcheck passes → api starts → connection succeeds
+        condition: service_healthy
+
+volumes:
+  # Named volume declaration — Docker manages the actual storage directory.
+  # This must be declared at the top level to be usable by services above.
+  # The data survives container restarts and `docker compose down`.
+  # It is only removed by `docker compose down -v`.
+  postgres_data:
