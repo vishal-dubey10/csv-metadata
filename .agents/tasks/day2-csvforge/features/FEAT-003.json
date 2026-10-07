@@ -1,0 +1,26 @@
+{
+  "id": "FEAT-003",
+  "type": "feat",
+  "description": "Worker Lambda handler skeleton. Implement worker/handler.py — the Lambda entry point that orchestrates the full CSV processing pipeline: receive SQS event, claim job, download CSV from S3, parse and validate, clean, write output, upload to S3, update PostgreSQL. Depends on FEAT-001 (s3_client.py, sqs_client.py) and FEAT-002 (csv_processor.py, exceptions.py). Implement after both FEAT-001 and FEAT-002 are complete.",
+  "status": "completed",
+  "steps": [
+    "Step 1: Write `worker/handler.py` — implement `lambda_handler(event, context)` that: (a) iterates over SQS records in event['Records']; (b) for each record, parses the body JSON via sqs_client.parse_job_message(); (c) opens a DB session via SessionLocal(); (d) calls claim_job_for_processing(db, job_id) — if False, logs and returns (job is in terminal state or already claimed by another worker); (e) downloads the CSV from S3 to /tmp/{job_id}_input.csv via download_file(); (f) calls parse_and_analyse() — catches InvalidCSVError, calls fail_job(), logs the failure reason, and returns (no exception raised — SQS will delete the message); (g) calls clean(analysis.rows) to get CleanResult; (h) calls write_csv(/tmp/{job_id}_output.csv, column_names, cleaned_rows); (i) constructs the processed S3 key: processed/{job_id_from_db_job.user_id}/{job_id}/result.csv — user_id comes from the DB job record, NOT from the SQS message (AD-08 security principle); (j) calls upload_file(bucket, processed_key, output_path) — S3 write BEFORE DB update (AD-14); (k) calls complete_job() with all result fields; (l) handles any other exception by calling fail_job() with the exception message and re-raising (transient failure: SQS will retry). Include a full module docstring with the WHAT/WHY/ARCHITECTURE sections and the complete processing pipeline as a numbered list.",
+    "Step 2: Add a `if __name__ == '__main__':` block at the bottom of worker/handler.py for local testing, reading a test event from a JSON file (see docs for run_local.sh pattern described in AD-28).",
+    "Step 3: Write `tests/unit/test_worker_handler.py` — use moto @mock_aws + unittest.mock.patch for DB calls. Tests: happy path (valid CSV in mocked S3) calls complete_job with correct metadata; invalid CSV (empty file) calls fail_job and does NOT raise; transient failure (S3 download raises an unexpected exception) calls fail_job and re-raises; job already completed (claim_job returns False) returns immediately without calling S3 or csv_processor; worker reads user_id from the database job record (not from the SQS message body).",
+    "Step 4: Update FEAT-003 status to completed and record in findings: whether the handler imports from backend.db (connection.py, job_repository.py) and backend.models (job.py) correctly via PYTHONPATH, the S3 bucket env var name used (S3_BUCKET_NAME), and any divergence from the plan."
+  ],
+  "acceptance_criteria": [
+    "Running `PYTHONPATH=. .venv/bin/pytest tests/unit/test_worker_handler.py -v` passes all worker handler tests",
+    "Running `PYTHONPATH=. .venv/bin/pytest tests/unit/ -v` passes ALL unit tests with no regressions",
+    "worker/handler.py exists with lambda_handler(event, context) documented with the full pipeline as a numbered list",
+    "worker/handler.py reads user_id from the database job record (not from the SQS message)",
+    "worker/handler.py writes S3 output BEFORE calling complete_job (AD-14 ordering enforced)",
+    "worker/handler.py does NOT raise for InvalidCSVError (permanent failure path returns cleanly)"
+  ],
+  "verification": [
+    "cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/test_worker_handler.py -v",
+    "cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/ -v"
+  ],
+  "blocked_reason": null,
+  "findings": "COMPLETED (iteration 1). Imports: handler.py imports from backend.db.connection (SessionLocal), backend.db.job_repository (claim_job_for_processing, complete_job, fail_job, get_job_by_id), backend.s3_client (download_file, upload_file), backend.sqs_client (parse_job_message) — all via PYTHONPATH, working correctly. S3 bucket env var: S3_BUCKET_NAME for input bucket, S3_OUTPUT_BUCKET for output bucket (falls back to S3_BUCKET_NAME if not set). Divergences from plan: (1) S3 bucket env vars are read at invocation time (inside _get_input_bucket()/_get_output_bucket() helpers) rather than as module-level constants — this was necessary because test_upload_endpoints.py sets S3_BUCKET_NAME='csvforge-files-dev' inside test methods without restoring it, which would pollute the module-level constants. Reading at invocation time and using patch.dict(os.environ, _TEST_ENV) in the test methods solves the isolation problem without changing any existing test files. (2) file_size_bytes is read from os.path.getsize(output_path) for the actual cleaned output file size rather than the input file size — this correctly represents the processed file size stored in PostgreSQL. All 140 unit tests pass (131 pre-existing + 9 new)."
+}
