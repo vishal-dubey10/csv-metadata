@@ -70,6 +70,61 @@ STRETCH ─┬── T-30 (Failure + DLQ integration tests)
          └── T-34 (CloudWatch alarms + DLQ verification)
 ```
 
+```json
+{
+  "waves": [
+    {
+      "wave": 1,
+      "day": 1,
+      "tasks": ["T-01", "T-02", "T-03", "T-04"],
+      "description": "Repository scaffold, DB connection, Job model, Job repository"
+    },
+    {
+      "wave": 2,
+      "day": 2,
+      "tasks": ["T-05", "T-06", "T-07", "T-08"],
+      "description": "CSV parser, CSV cleaner, S3 client, SQS client"
+    },
+    {
+      "wave": 3,
+      "day": 3,
+      "tasks": ["T-09", "T-10", "T-11"],
+      "description": "Worker Lambda handler, Worker Dockerfile, Frontend scaffold"
+    },
+    {
+      "wave": 4,
+      "day": 4,
+      "tasks": ["T-12", "T-13", "T-14", "T-15"],
+      "description": "Pydantic schemas, JWT auth dependency, Upload endpoints, Job status + download endpoints"
+    },
+    {
+      "wave": 5,
+      "day": 5,
+      "tasks": ["T-16", "T-17", "T-18", "T-19"],
+      "description": "Admin endpoints, network.yaml, data.yaml, queues.yaml + auth.yaml"
+    },
+    {
+      "wave": 6,
+      "day": 6,
+      "tasks": ["T-20", "T-21"],
+      "description": "api.yaml + worker.yaml + deploy.sh, React auth context + Cognito login form"
+    },
+    {
+      "wave": 7,
+      "day": 7,
+      "tasks": ["T-22", "T-23", "T-24", "T-25", "T-26", "T-27"],
+      "description": "Upload flow UI, Download UI, React Admin, Cognito auth verification, Backend integration tests, End-to-end smoke test"
+    },
+    {
+      "wave": 8,
+      "day": "stretch",
+      "tasks": ["T-28", "T-29", "T-30", "T-31", "T-32"],
+      "description": "Failure + DLQ tests, Frontend Vitest suite, CodeBuild buildspec, CodePipeline, CloudWatch alarms"
+    }
+  ]
+}
+```
+
 ---
 
 ## Kiro Workflow — Every CORE Task
@@ -1479,3 +1534,15 @@ After Day 7 you should be able to answer:
 | Docker test proved only container starts | Changed to RIE handler invocation test | T-10 |
 | FastAPI 0.140.0 (stale) | Updated to 0.141.1 | AD-22 |
 
+
+## Notes
+
+- All CORE tasks follow the Explain → Predict → Implement → Break → Debug → Explain-back cycle documented in the "Kiro Workflow" section above.
+- STRETCH tasks (T-28 through T-32) should only be started after all 27 CORE tasks are complete and verified.
+- The verified stack versions in this plan supersede any versions mentioned in `docs/requirements.md` or `docs/DECISIONS.md`. See `docs/VERSIONS.md` for the canonical version matrix.
+- All architecture decisions referenced as `AD-XX` are documented in `docs/DECISIONS.md`.
+- Progress for each completed task should be recorded in `docs/PROGRESS.md` using the commit checkpoint message as the entry.
+- The `.env` file must never be committed. Use `.env.example` as the template and document every variable there.
+- Local development uses `ENVIRONMENT=local` to enable the JWT bypass (`X-Dev-User-Id` / `X-Dev-User-Email` headers). This bypass is strictly disabled in production.
+- The worker Docker build context must always be the project root (not `./worker/`) to allow `COPY backend/` in the Dockerfile (AD-18).
+- Integration tests require Docker Compose running (`docker compose up -d`) before execution.
