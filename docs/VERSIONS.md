@@ -46,13 +46,13 @@ Python 3.14 is GA on Lambda (deprecation Jun 2029). psycopg 3.3 explicitly suppo
 | **Pydantic** | 2.13.4 | **2.13.4** | pypi.org/project/pydantic/2.13.4 (Apr 2026) | v2 API throughout; `model_config`, `field_validator`, `model_validator` |
 | **Uvicorn** | 0.51.x | **0.51.0** | pypi.org/project/uvicorn/0.50.2 "newer 0.51 available"; github.com/Kludex/uvicorn | Previous docs had 0.34.x — stale. Use `uvicorn[standard]` |
 | **SQLAlchemy** | 2.1.0rc2 (Sep 8, 2026 — RC); 2.0.54 stable | **2.0.54** | docs.sqlalchemy.org/en/20/ "2.0.54 current release Sep 15, 2026" | SQLAlchemy 2.1 RC — not production-ready. 2.0.54 is the latest stable 2.0 patch. |
-| **Alembic** | 1.20.1 | **1.20.1** | alembic.sqlalchemy.org/en/latest/changelog.html ("1.20.1" listed) | Tracks SQLAlchemy 2.x |
+| **Alembic** | 1.20.1 | **1.20.0** | alembic.sqlalchemy.org/en/latest/changelog.html | Tracks SQLAlchemy 2.x. 1.20.1 not yet released on PyPI at implementation time; using 1.20.0 (latest available). |
 | **psycopg (v3)** | 3.3.3 | **3.3.3** | pypi.org/project/psycopg/3.3.3 (confirmed); psycopg.org/psycopg3/ "currently version 3.3" | Install as `psycopg[binary]==3.3.3`; binary extra bundles libpq. Python 3.14 supported. |
 | **boto3** | 1.43.x | **1.43.63** | pypi.org/project/boto3/1.43.63 | Pin despite Lambda bundling; ensures reproducibility |
 | **Mangum** | 0.22.0 | **0.22.0** | pypi.org/project/mangum/0.22.0 | ASGI adapter; HTTP API payload format 2.0 |
 | **python-dotenv** | 1.1.x | **1.1.0** | pypi.org/project/python-dotenv | Local .env loading only |
 | **pytest** | 9.1.1 | **9.1.1** | pypi.org/project/pytest/ "pytest 9.1.1" (confirmed) | Previous docs had "8.x" — stale |
-| **moto** | 5.2.x | **5.2.4** | docs.getmoto.org "5.2.4.dev" / pypi "5.2.x" | AWS mocking; compatible with boto3 1.43.x |
+| **moto** | 5.2.x | **5.2.3** | pypi.org/project/moto | AWS mocking; compatible with boto3 1.43.x. 5.2.4 not yet released at implementation time. |
 
 **FastAPI version correction note:**  
 Previous audit recorded FastAPI `0.115.x`. A benchmark article from July 2026 confirmed FastAPI `0.139.0` was current at that time; GitHub releases show `0.141.x` by Oct 2026. The old value was stale by ~25 minor versions. **All references to `0.115.x` must be removed.**
