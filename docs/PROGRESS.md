@@ -60,3 +60,71 @@ See `.kiro/specs/csv-processing/tasks.md` for the complete 7-day plan.
 
 *(Updated after each completed task)*
 
+---
+
+## Day 2 — AWS Infrastructure, Worker, and Documentation
+
+**Completed:** Lambda worker (FEAT-003), IAM policy files, deployment scripts, pytest aws marker, AWS integration test skeleton, FAILURE_EXPERIMENTS.md, DAY2_LEARNING_GUIDE.md, aws-standards.md steering file, Day 2 decisions (AD-D2-01 through AD-D2-09), Day 2 infrastructure report.
+
+### What Was Built
+
+**FEAT-001 — Database Layer (Day 1)**
+SQLAlchemy models, Alembic migrations, job repository with conditional UPDATE idempotency guard, full unit test suite.
+
+**FEAT-002 — FastAPI REST API (Day 1)**
+Upload intent endpoint (presigned PUT URL generation), upload complete endpoint (HeadObject + SQS publish), job status endpoint, download URL endpoint (presigned GET URL). PostgreSQL-backed, tested with moto for AWS mocks.
+
+**FEAT-003 — Lambda Worker Handler (Day 2)**
+`worker/handler.py`: receives SQS event, claims job from PostgreSQL, downloads raw CSV from S3, delegates to `csv_processor.py`, uploads processed CSV to S3, updates job to `completed`. Handles `InvalidCSVError` as permanent failure (clean return, job marked `failed`) vs all other exceptions as transient failures (re-raise, SQS retries). user_id sourced from DB record, not SQS message (AD-D2-08).
+
+### Unit Test Count
+
+**140 tests** — all passing. Run with:
+```
+cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/ -v
+```
+
+### AWS Resource Names (No Credentials)
+
+| Resource | Type | Name |
+|---|---|---|
+| File storage | S3 Bucket | `csvforge-files-dev` |
+| Job queue | SQS Queue | `csvforge-jobs-dev` |
+| Failed jobs | SQS DLQ | `csvforge-jobs-dlq-dev` |
+| Worker function | Lambda | `csvforge-worker-dev` |
+| Worker permissions | IAM Role | `csvforge-worker-role-dev` |
+
+Region: `ap-south-1` (Mumbai) — all resources in one region (AD-D2-01).
+
+### Files Created / Modified in Day 2
+
+**New files:**
+- `worker/handler.py` — Lambda handler entry point (FEAT-003)
+- `worker/csv_processor.py` — CSV parsing, validation, cleaning logic
+- `worker/exceptions.py` — `InvalidCSVError`
+- `worker/requirements.txt` — Worker pip dependencies
+- `infrastructure/iam/lambda-execution-policy.json` — Lambda IAM permissions
+- `infrastructure/iam/lambda-trust-policy.json` — Lambda trust policy
+- `infrastructure/iam/api-service-policy.json` — API service IAM permissions
+- `infrastructure/iam/README.md` — Least privilege documentation
+- `infrastructure/create_dev_resources.sh` — Provision S3, SQS, IAM idempotently
+- `infrastructure/deploy_lambda.sh` — Build zip, deploy Lambda, configure ESM
+- `tests/integration/test_aws_integration.py` — Real-AWS integration tests (marked `aws`)
+- `docs/FAILURE_EXPERIMENTS.md` — 4 failure scenarios with AWS CLI demonstrations
+- `docs/DAY2_LEARNING_GUIDE.md` — Comprehensive architecture guide (23 interview Q&As)
+- `.kiro/steering/aws-standards.md` — AWS/distributed systems coding standards
+- `.agents/tasks/day2-report.md` — Implementation summary
+
+**Modified files:**
+- `pytest.ini` — Added `aws` marker
+- `docs/DECISIONS.md` — Appended AD-D2-01 through AD-D2-09
+- `docs/PROGRESS.md` — This Day 2 section
+
+### What Day 3 Should Tackle
+
+- **React frontend** — upload wizard (file select, presigned PUT, progress bar), job status polling (GET /jobs/{job_id} every 3s), download button (GET /jobs/{job_id}/download)
+- **Cognito authentication** — user pool setup, hosted UI or custom login page, JWT token injection into API requests
+- **API Gateway integration** — HTTP API with JWT authorizer pointing to Cognito user pool
+- **CloudFormation stacks** — `network.yaml` (VPC, subnets, security groups), `compute.yaml` (Lambda functions, API Gateway)
+- **CI/CD pipeline** — CodeBuild buildspec.yml (test → build Docker image → push ECR), CodePipeline (source → build → deploy)
+

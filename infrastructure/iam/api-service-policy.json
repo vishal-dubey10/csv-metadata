@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3PresignedUpload",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::csvforge-files-dev/uploads/*"
+    },
+    {
+      "Sid": "SQSPublish",
+      "Effect": "Allow",
+      "Action": ["sqs:SendMessage"],
+      "Resource": "arn:aws:sqs:ap-south-1:*:csvforge-jobs-dev"
+    }
+  ]
+}

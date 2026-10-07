@@ -472,3 +472,91 @@ A transactional outbox pattern would write the SQS message intent to the databas
 2. `aws cloudformation deploy --stack-name csvforge-worker --template-file infrastructure/worker.yaml --parameter-overrides ImageTag=$IMAGE_TAG`
 3. `aws s3 sync frontend/dist/ s3://${FRONTEND_BUCKET}/`
 
+---
+
+## AD-D2-01 — Region choice (ap-south-1)
+
+**Decision:** All CSVForge dev resources are in ap-south-1 (Mumbai).
+
+**Rationale:** Consistency — all clients, all resources, all CloudFormation stacks in one region. Cross-region calls add latency and complexity. Lambda in us-east-1 calling SQS in ap-south-1 would add ~150ms per operation.
+
+**Trade-off:** Not the cheapest region (us-east-1 is ~20% cheaper for most services). Acceptable for a learning project where the developer is in India.
+
+---
+
+## AD-D2-02 — Standard SQS not FIFO
+
+**Decision:** Use Standard SQS queue, not FIFO.
+
+**Rationale:** (1) Each job_id is independent — ordering between different jobs is irrelevant. (2) Standard SQS is ~3× cheaper than FIFO for the same throughput. (3) Standard SQS has effectively unlimited throughput; FIFO is capped at 300 TPS. (4) The idempotency guard in the worker handles duplicate delivery, which Standard SQS may produce but FIFO would not.
+
+**Trade-off:** At-least-once delivery (Standard) vs exactly-once delivery (FIFO). Mitigated by worker idempotency.
+
+---
+
+## AD-D2-03 — Presigned PUT not API proxy
+
+**Decision:** Browser uploads directly to S3 via presigned PUT URL. The CSV never passes through FastAPI or Lambda.
+
+**Rationale:** (1) API Gateway HTTP API has a 10 MB payload limit. (2) Routing 50 MB through Lambda wastes Lambda memory, execution time, and API Gateway bandwidth. (3) Presigned URLs scope the write to a specific key and expire in 15 minutes. (4) content-length-range condition enforces file size limit without the API touching the bytes.
+
+**Security:** The API generates the presigned URL using its IAM role. The URL signature binds the IAM principal, bucket, key, method, and expiry — it is not a capability leak.
+
+---
+
+## AD-D2-04 — Visibility timeout 1800s
+
+**Decision:** SQS visibility timeout = 1800 seconds (30 minutes).
+
+**Rationale:** AWS recommends visibility timeout ≥ 6× Lambda timeout. Lambda timeout = 300s → 6 × 300 = 1800s. This gives substantial buffer beyond worst-case execution, covering network variance and cold-start overhead.
+
+**Trade-off:** A crashed message stays invisible for up to 30 minutes per attempt. Across 5 retries, a permanent failure takes up to 2.5 hours to reach the DLQ. Acceptable for async background processing.
+
+---
+
+## AD-D2-05 — DLQ max receive count 5
+
+**Decision:** MaxReceiveCount = 5 before message moves to DLQ.
+
+**Rationale:** AWS documentation recommends maxReceiveCount ≥ 5. With MaxReceiveCount = 3, a job could reach the DLQ due to cold-start delays or transient network issues, not real failures. 5 gives enough retries to distinguish transient from permanent failures.
+
+**Trade-off:** More retries means longer time before a truly broken job reaches the DLQ (5 × 1800s = 2.5 hours worst case).
+
+---
+
+## AD-D2-06 — Lambda pool_size=2 for DB connections
+
+**Decision:** SQLAlchemy pool_size=2 in SessionLocal for the Lambda context.
+
+**Rationale:** Lambda runs in many concurrent execution environments. A pool_size of 10 (SQLAlchemy default) × many concurrent Lambdas = PostgreSQL connection exhaustion. Pool size 2 with pool_pre_ping=True provides one active connection plus one overflow, appropriate for single-threaded Lambda invocations.
+
+**Future:** RDS Proxy provides connection pooling at the infrastructure layer, making per-Lambda pool size less critical.
+
+---
+
+## AD-D2-07 — S3 BEFORE DB update ordering
+
+**Decision:** Worker uploads processed file to S3 before calling complete_job() to update PostgreSQL.
+
+**Rationale:** S3 writes are not transactional with PostgreSQL. If complete_job() fails after the S3 upload, the Lambda re-raise causes SQS to retry. On retry, the worker re-uploads the same S3 key (idempotent — S3 PutObject is idempotent on the same key), then retries complete_job(). If the DB write happened first and then S3 failed, we'd have a 'completed' record with no output file — an unrecoverable inconsistency. AD-14.
+
+---
+
+## AD-D2-08 — user_id from DB not SQS message
+
+**Decision:** The processed S3 key uses user_id from the DB job record, not from the SQS message body.
+
+**Rationale:** SQS messages are untrusted. If user_id came from the SQS message, a malicious actor who could publish to the SQS queue could specify any user_id in the message body, causing the worker to write processed files to any user's S3 prefix. By sourcing user_id from the DB record (written by the API when it created the job), the S3 key is determined by the authenticated API request, not the queue message.
+
+**Security:** This prevents S3 path traversal attacks via SQS message spoofing.
+
+---
+
+## AD-D2-09 — Single bucket vs two buckets
+
+**Decision:** Single S3 bucket csvforge-files-dev with uploads/ and processed/ prefixes.
+
+**Rationale:** For development, one bucket is simpler to manage: one set of CORS rules, one bucket policy, one CloudFormation resource. The IAM policies enforce prefix-level separation (uploads/* vs processed/*), providing the same security boundary as two buckets.
+
+**Production path:** Separate buckets per principle of least privilege — the Lambda worker's role would have no access to the uploads bucket at all, only the processed bucket. For MVP, the complexity is not justified.
+
