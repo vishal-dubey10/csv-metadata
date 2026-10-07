@@ -1,0 +1,63 @@
+# CSVForge — dependencies for the worker Lambda function.
+#
+# WHY THIS FILE IS SEPARATE FROM backend/requirements.txt:
+#   The worker is deployed as a distinct Lambda zip artifact. It has no HTTP
+#   server, no API framework, and no migration tooling. Keeping its deps
+#   separate means the worker's deployment artifact is smaller and its cold
+#   start is faster — it only loads what it actually uses.
+#
+# NOTABLE ABSENCES (and why each is intentional):
+#
+#   fastapi / uvicorn[standard]:
+#     The worker is triggered by SQS events, not HTTP requests. There is no
+#     HTTP server to start; Lambda calls the handler function directly. Adding
+#     FastAPI would import the full framework (Starlette, Pydantic routers,
+#     OpenAPI generation) for zero benefit.
+#
+#   mangum:
+#     Mangum's only purpose is to wrap a FastAPI (ASGI) app so it can receive
+#     API Gateway events. The worker receives SQS events, which have a
+#     completely different structure and need no ASGI translation layer.
+#
+#   alembic:
+#     Alembic manages schema migrations. The worker reads and writes data; it
+#     never alters the schema. Running `alembic upgrade head` is done by the
+#     API Lambda (or a dedicated migration job) during deployments, not by a
+#     worker invocation that may happen millions of times at scale.
+#
+#   pydantic / pydantic-settings:
+#     The worker doesn't define HTTP schemas or use a settings class. It reads
+#     a handful of env vars directly with os.environ[]. Adding pydantic would
+#     add ~15 MB to the Lambda zip for no practical gain.
+#
+# EXACT VERSIONS:
+#   Pinned for the same reason as backend/requirements.txt — reproducible
+#   builds prevent silent breakage when reinstalling in a fresh environment.
+
+# boto3 — AWS SDK for Python. The worker uses boto3 in two ways:
+#   (1) S3: download the uploaded CSV file for processing.
+#   (2) SQS: delete the message after successful processing (so the queue
+#       doesn't redeliver it). In production, boto3 uses the Lambda execution
+#       role's IAM credentials automatically — no keys needed in env vars.
+boto3==1.43.63
+
+# SQLAlchemy — ORM toolkit for reading and writing job records.
+# The worker updates job status (pending → processing → completed/failed)
+# in PostgreSQL using the same ORM models and repository functions as the API.
+# Sharing the SQLAlchemy layer via the `backend.db` package means job state
+# transitions are implemented once and used by both the API and the worker.
+sqlalchemy==2.0.54
+
+# psycopg[binary] — PostgreSQL driver (psycopg 3).
+# SQLAlchemy needs a driver to connect to PostgreSQL. Same driver as the API
+# for consistency: one driver version to audit, one set of connection semantics.
+# The [binary] extra bundles the pre-compiled C extension so no compiler or
+# libpq-dev headers are needed in the Lambda build environment.
+psycopg[binary]==3.3.3
+
+# python-dotenv — reads .env into os.environ for local development.
+# In Lambda, environment variables are set by the Lambda service and there
+# is no .env file; load_dotenv() silently does nothing. Locally, it allows
+# `ENVIRONMENT=local DATABASE_URL=...` to be set via a .env file rather than
+# typing export commands before every test run.
+python-dotenv==1.1.0

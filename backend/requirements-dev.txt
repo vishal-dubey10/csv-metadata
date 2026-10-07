@@ -1,0 +1,46 @@
+# CSVForge — development and test dependencies for the backend.
+#
+# WHY SEPARATE FROM requirements.txt:
+#   These packages are needed to run tests and develop locally, but they must
+#   NOT be included in the Lambda deployment artifact. Two reasons:
+#     1. Artifact size: Lambda has a 250 MB unzipped limit. pytest, moto, and
+#        their transitive dependencies would add ~100 MB for no runtime benefit.
+#     2. Security surface: shipping test tools to production is unnecessary risk.
+#   By keeping them here, `pip install -r requirements.txt` (used in the Lambda
+#   build) omits all of this, while developers and CI use both files.
+#
+# HOW TO INSTALL (local dev):
+#   pip install -r requirements.txt
+#   pip install -r requirements-dev.txt
+#
+# The `-r requirements.txt` line below tells pip to install the production
+# deps first, then the dev deps — one command installs everything.
+-r requirements.txt
+
+# pytest — the test runner that discovers and executes the test suite.
+# Finds files named test_*.py, collects functions named test_*, and reports
+# results. Manages fixtures (setup/teardown) via conftest.py. The standard
+# test runner for modern Python projects; preferred over unittest for its
+# concise assertion syntax and powerful fixture system.
+pytest==9.1.1
+
+# moto — AWS mock library for testing boto3 code without a real AWS account.
+# moto intercepts boto3 API calls (at the HTTP level) and returns fake but
+# realistic responses. For example, moto[s3] makes `boto3.client("s3")` think
+# it's talking to real S3, storing objects in memory instead. This means tests
+# that call S3 or SQS run in milliseconds, work offline, and never incur AWS
+# costs. The [s3,sqs] extras install only the mocked services CSVForge uses.
+moto[s3,sqs]==5.2.3
+
+# httpx2 — HTTP client required by FastAPI's (Starlette's) TestClient.
+# FastAPI's TestClient wraps Starlette's TestClient, which in turn requires
+# an HTTP client library to make in-process ASGI requests. Starlette originally
+# used httpx; the project migrated to httpx2 (its maintained fork). Without
+# this package, `from starlette.testclient import TestClient` raises an
+# ImportError at test collection time.
+# Note: httpx2 is NOT needed in production — the Lambda handles real HTTP via
+# API Gateway, not via an in-process client.
+httpx2==2.13.1
+
+# pytest-asyncio: deferred to Day 4 (needs a pytest-9-compatible version >=0.25)
+# No async tests exist in Day 1.
