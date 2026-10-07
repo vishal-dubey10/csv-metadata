@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge Data Layer — S3 bucket for CSV uploads and processed output.
+
+  WHAT THIS TEMPLATE DOES:
+    Creates the S3 bucket that stores all CSV files for CSVForge:
+      - Raw uploads from the browser (placed there by the user via presigned URL)
+      - Processed output files (placed there by the Lambda worker after cleaning)
+
+  WHY CLOUDFORMATION INSTEAD OF CLI:
+    A CloudFormation template is "infrastructure as code" — the bucket
+    configuration lives in version control alongside the application.
+    If the bucket is accidentally deleted or needs to be recreated in a
+    new region, you run one command instead of remembering multiple CLI
+    flags. CloudFormation also detects drift (manual changes that diverge
+    from the template) and can roll back failed changes atomically.
+
+  HOW TO DEPLOY:
+    aws cloudformation deploy \
+      --template-file infrastructure/data.yaml \
+      --stack-name csvforge-data-dev \
+      --region ap-south-1
+
+  HOW TO DELETE (destroys the bucket — use with caution):
+    aws cloudformation delete-stack --stack-name csvforge-data-dev --region ap-south-1
+
+  ANALOGY — S3 is a warehouse, not a filesystem:
+    Think of an S3 bucket as a massive warehouse with no shelves.
+    Every item (object) is stored flat on the floor, but each item has a
+    label (key) that can contain slashes. The slashes look like folder paths
+    but are part of the key name — there are no real directories in S3.
+    "uploads/user-1/job-abc/original.csv" is a single object key, not a
+    file inside three nested folders.
+
+    Bucket  = the warehouse building
+    Key     = the address label on each box (e.g. "uploads/user-1/job-1/original.csv")
+    Object  = the actual box (the file bytes + metadata)
+    Prefix  = the part of the key before a delimiter (like "uploads/") —
+              used for pseudo-folder filtering in list operations
+    Metadata = labels attached to the box (ContentType, custom headers)
+
+  OBJECT KEY STRUCTURE:
+    uploads/{user_id}/{job_id}/original.csv
+      ↑ raw upload from the browser via presigned PUT URL
+
+    processed/{user_id}/{job_id}/result.csv
+      ↑ cleaned output written by the Lambda worker
+
+    WHY JOB_ID IS IN THE KEY:
+      The key is deterministic. Given a job record in PostgreSQL, you always
+      know exactly where its file lives — no need to search S3.
+      It also namespaces files per job: a re-upload cannot overwrite a
+      different job's file because each job has its own unique ID prefix.
+
+  IMPORTANT CONCEPTS:
+    - S3 is object storage, NOT a POSIX filesystem. Objects cannot be
+      partially updated — you replace them entirely. There are no hard links,
+      symlinks, or file locks.
+    - Keys are UTF-8 strings up to 1024 bytes. Slashes are valid characters
+      in a key; S3 does not treat them as directory separators natively.
+    - Presigned URLs are time-limited signed requests — they grant a caller
+      temporary access to one specific operation (PUT or GET) on one specific
+      key without requiring the caller to have AWS credentials. See AD-02.
+    - Public access is blocked at every level: ACLs, bucket policies, and
+      access points. Files are only accessible via presigned URLs or IAM roles.
+
+  Interview concept:
+    "What is the difference between object storage and block storage?"
+    Block storage (EBS) presents raw disk blocks — the OS manages the filesystem,
+    file seek, partial writes. Object storage (S3) stores and retrieves complete
+    objects by key over HTTP — no partial updates, no filesystem semantics.
+    Object storage scales to exabytes because objects are stored as independent
+    units; block storage is bounded by the capacity of one disk.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: csvforge-files-dev
+    Description: >
+      Globally unique bucket name. Must be lowercase, 3-63 chars, no underscores.
+      The "dev" suffix distinguishes this from staging/production buckets.
+      AWS S3 bucket names are globally unique across ALL AWS accounts worldwide —
+      if someone else already owns "csvforge-files-dev", creation will fail.
+
+Resources:
+
+  # ── Primary S3 Bucket ──────────────────────────────────────────────────────
+  # This single bucket holds BOTH raw uploads and processed outputs, separated
+  # by key prefix ("uploads/" vs "processed/"). Using one bucket simplifies
+  # the IAM policy: the Lambda worker needs read from "uploads/" and write to
+  # "processed/" — both on the same bucket ARN.
+  CSVForgeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+
+      # ── Block ALL public access ─────────────────────────────────────────────
+      # S3 has multiple independent layers that can grant public access.
+      # Blocking all four here ensures no misconfigured bucket policy or ACL
+      # can accidentally expose uploaded files to the internet.
+      #
+      # BlockPublicAcls:       Reject any PUT that would attach a public ACL.
+      # IgnorePublicAcls:      Ignore any existing public ACLs (defense in depth).
+      # BlockPublicPolicy:     Reject bucket policy changes that grant public access.
+      # RestrictPublicBuckets: Even if a policy grants public access somehow,
+      #                        don't honor it for unauthenticated requests.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+      # ── Versioning (disabled for dev) ──────────────────────────────────────
+      # Versioning would keep every overwritten or deleted version of every
+      # object. Useful for production (accidental deletes recoverable), but
+      # adds storage cost and complexity for the dev environment.
+      # Enable for production stacks.
+      VersioningConfiguration:
+        Status: Suspended
+
+      # ── Server-side encryption ─────────────────────────────────────────────
+      # S3-managed keys (SSE-S3) encrypts every object at rest automatically.
+      # The key is managed by AWS — no extra cost, no key rotation to manage.
+      # For stricter compliance requirements, replace with SSE-KMS (customer-
+      # managed key), which provides audit logs in CloudTrail and key rotation
+      # control.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      # ── CORS configuration for browser direct upload ───────────────────────
+      # CORS (Cross-Origin Resource Sharing) is a browser security feature.
+      # By default, a browser running at http://localhost:5173 (Vite dev server)
+      # CANNOT make a PUT request to https://s3.amazonaws.com/... because those
+      # are different origins. The browser blocks the request before it sends.
+      #
+      # S3's CORS configuration tells the browser: "requests from these origins
+      # are allowed for these HTTP methods." This enables the presigned PUT
+      # upload flow: the browser POSTs to FastAPI to get a presigned URL, then
+      # PUTs the file directly to S3.
+      #
+      # WHY "PUT" ONLY:
+      #   The browser only needs PUT to upload. GET requests for download also
+      #   use presigned URLs but are typically triggered by <a href="..."> links
+      #   or fetch() calls that S3 CORS allows via AllowedOrigins + GET. We keep
+      #   the permission surface minimal: only what the browser workflow needs.
+      #
+      # WHY ExposeHeaders ETag:
+      #   The ETag is S3's checksum for the uploaded object. After the PUT
+      #   succeeds, the browser can read the ETag from the response headers
+      #   and send it to FastAPI's /uploads/{job_id}/complete endpoint as proof
+      #   that the upload completed. Without ExposeHeaders, the browser cannot
+      #   read the ETag from the cross-origin response.
+      #
+      # AllowedOrigins in production:
+      #   Replace http://localhost:5173 with your production frontend domain.
+      #   Wildcards (*) should not be used in production — they would allow
+      #   any website to PUT files into the bucket using a presigned URL.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+            AllowedOrigins:
+              - "http://localhost:5173"
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+
+      # ── Lifecycle rules (optional, disabled by default) ────────────────────
+      # Lifecycle rules automatically transition or delete objects after N days.
+      # For production: consider moving "uploads/" to Glacier after 90 days
+      # (raw uploads are no longer needed after processing). For dev, we leave
+      # this unconfigured to avoid accidentally deleting test data.
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket for CSV uploads and processed outputs.
+    Value: !Ref CSVForgeBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+
+  BucketArn:
+    Description: >
+      ARN of the S3 bucket. Used in IAM policy Resource fields:
+        "Resource": ["<BucketArn>", "<BucketArn>/*"]
+      The first ARN grants bucket-level permissions (ListBucket);
+      the second ARN (with /*) grants object-level permissions (GetObject, PutObject).
+      You need BOTH for most real workflows.
+    Value: !GetAtt CSVForgeBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketArn"

@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge Queue Layer — SQS main job queue and Dead-Letter Queue (DLQ).
+
+  WHAT THIS TEMPLATE DOES:
+    Creates two SQS Standard queues:
+      1. csvforge-jobs-dev-dlq  — the Dead-Letter Queue (DLQ); receives messages
+         that the Lambda worker failed to process after 5 attempts.
+      2. csvforge-jobs-dev      — the main job queue; FastAPI enqueues a message
+         here after a file is uploaded, Lambda reads messages from here.
+
+  WHY TWO QUEUES:
+    The DLQ is a safety net. When the Lambda worker crashes on a message
+    (database down, malformed CSV, unexpected exception), SQS makes the
+    message visible again after the VisibilityTimeout expires — like a job
+    ticket returning to the queue. After MaxReceiveCount (5) failed attempts,
+    SQS gives up and moves the message to the DLQ automatically. The DLQ:
+      - Prevents an unprocessable message ("poison pill") from blocking the queue.
+      - Retains failed messages for up to 4 days for investigation.
+      - Can trigger a CloudWatch alarm when messages accumulate (operational signal).
+
+  HOW TO DEPLOY:
+    aws cloudformation deploy \
+      --template-file infrastructure/queues.yaml \
+      --stack-name csvforge-queues-dev \
+      --region ap-south-1
+
+  HOW TO VIEW QUEUE ATTRIBUTES AFTER DEPLOY:
+    aws sqs get-queue-attributes \
+      --queue-url https://sqs.ap-south-1.amazonaws.com/{account}/csvforge-jobs-dev \
+      --attribute-names All \
+      --region ap-south-1
+
+  ANALOGY — SQS is a job ticket board:
+    Think of SQS as a physical job ticket board in a factory:
+    - FastAPI (the reception desk) writes a ticket and pins it to the board.
+    - The Lambda worker (factory worker) picks up a ticket, covers it with a
+      sticky note (VisibilityTimeout — "I'm working on this, don't let anyone
+      else take it"), and starts processing.
+    - On success: the worker tears up the ticket (DeleteMessage). Done.
+    - On failure: the sticky note expires (VisibilityTimeout reached), the
+      ticket becomes visible again on the board. Another worker can retry it.
+    - After 5 failures: the ticket is moved to the "failed jobs room" (DLQ)
+      for a supervisor (engineer) to investigate.
+
+  IMPORTANT CONCEPTS:
+    VisibilityTimeout:
+      When a consumer receives a message, SQS hides it from other consumers
+      for VisibilityTimeout seconds. This prevents two Lambda instances from
+      processing the same job simultaneously. The consumer must call
+      DeleteMessage before the timeout expires, or the message reappears.
+      Set this to slightly longer than the longest expected processing time
+      so a slow-but-succeeding worker isn't interrupted.
+
+    MaxReceiveCount (redrive policy):
+      After a message has been received (and NOT deleted) MaxReceiveCount
+      times, SQS considers it unprocessable and moves it to the DLQ.
+      Each failed Lambda invocation increments the receive count.
+      MaxReceiveCount=5 means 5 attempts before the DLQ.
+
+    Dead-Letter Queue (DLQ):
+      A separate queue where unprocessable messages land. The DLQ uses a
+      LONGER retention period (4 days) so engineers have time to inspect
+      the messages and understand why processing failed. A message in the
+      DLQ does NOT trigger Lambda — it sits there waiting for human review.
+      You can replay DLQ messages back to the main queue after fixing a bug.
+
+    MessageRetentionPeriod:
+      How long SQS keeps an unprocessed message before deleting it.
+      345600 seconds = 4 days. If the Lambda worker is completely down for
+      more than 4 days, messages are lost. Choose a retention window that
+      matches your operational SLA.
+
+    Standard vs FIFO queues:
+      Standard (this template): at-least-once delivery, best-effort ordering.
+        A message may occasionally be delivered more than once; receivers must
+        be idempotent (safe to process the same message twice). CSVForge uses
+        claim_job_for_processing() which is idempotent — see AD-29.
+      FIFO: exactly-once processing, strict ordering. Higher cost, lower
+        throughput (3000 msg/s vs 3000+ msg/s for Standard). Not needed for
+        CSV processing where order doesn't matter.
+
+  Interview concept:
+    "What is the SQS visibility timeout and why does it matter?"
+    The visibility timeout is the mechanism that prevents duplicate concurrent
+    processing while allowing retry on failure. Without it, if Lambda crashed
+    mid-processing, the message would disappear (deleted on receive) and the
+    job would be silently lost. With it, the message reappears after timeout
+    and another worker retries. This is the foundation of SQS's "at-least-once"
+    delivery guarantee.
+
+  See also: AD-17 in docs/DECISIONS.md for the VisibilityTimeout calculation
+  (6 × Lambda timeout of 300s = 1800s).
+
+Parameters:
+  MainQueueName:
+    Type: String
+    Default: csvforge-jobs-dev
+    Description: Name of the main SQS job queue that Lambda reads from.
+
+  DlqName:
+    Type: String
+    Default: csvforge-jobs-dev-dlq
+    Description: Name of the Dead-Letter Queue for unprocessable messages.
+
+Resources:
+
+  # ── Dead-Letter Queue (DLQ) ────────────────────────────────────────────────
+  # The DLQ MUST be created before the main queue because the main queue's
+  # redrive policy references the DLQ's ARN. CloudFormation resolves the
+  # !GetAtt reference at deploy time, ensuring correct creation order.
+  #
+  # WHY LONGER RETENTION ON DLQ:
+  #   Messages reach the DLQ only after all 5 retry attempts have failed.
+  #   By the time a message lands here, the original issue (bug, infra outage)
+  #   may have already been resolved. Engineers need time to:
+  #     1. Notice the alarm.
+  #     2. Investigate the root cause.
+  #     3. Fix the bug.
+  #     4. Replay the messages from the DLQ.
+  #   4 days (345600s) gives a reasonable window for this cycle.
+  CSVForgeJobsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref DlqName
+
+      # 4 days in seconds: 4 × 24 × 60 × 60 = 345600
+      # SQS will permanently delete messages older than this from the DLQ.
+      # If you need longer retention, the maximum is 1,209,600 (14 days).
+      MessageRetentionPeriod: 345600
+
+      # VisibilityTimeout on the DLQ:
+      # Messages in the DLQ are not typically consumed by Lambda. If you
+      # build a DLQ consumer (for replaying or archiving), set an appropriate
+      # timeout. Using the same value as the main queue is safe.
+      VisibilityTimeout: 1800
+
+  # ── Main Job Queue ─────────────────────────────────────────────────────────
+  # FastAPI sends one message here for each completed upload. Lambda is
+  # configured with this queue as an event source — Lambda polls the queue,
+  # receives up to 10 messages per batch, and invokes the handler once per
+  # message (or per batch, depending on BatchSize configuration).
+  CSVForgeJobsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref MainQueueName
+
+      # VisibilityTimeout = 1800 seconds (30 minutes).
+      #
+      # WHY 1800 SECONDS:
+      #   The Lambda worker timeout is set to 300 seconds (5 minutes) — see AD-17.
+      #   The VisibilityTimeout must be LONGER than the Lambda timeout.
+      #   If VisibilityTimeout < Lambda timeout, the message could become
+      #   visible again while the Lambda is still processing it, causing another
+      #   Lambda to pick up the same message and process it twice.
+      #
+      #   We use 6 × Lambda timeout = 6 × 300 = 1800 seconds. The extra factor
+      #   of 6 accounts for SQS polling delays, Lambda cold start time (~1-5s),
+      #   and any overhead between message receipt and handler execution.
+      #
+      #   If processing takes longer than 1800s (e.g., a 50 MB CSV), increase
+      #   both the Lambda timeout and this value proportionally.
+      VisibilityTimeout: 1800
+
+      # 4 days retention on the main queue.
+      # If all Lambda workers are down (deployment, region outage, bug),
+      # messages queue up here for up to 4 days before being silently dropped.
+      # Monitor queue depth (ApproximateNumberOfMessagesVisible) in CloudWatch
+      # and alert if it grows unexpectedly — that indicates the worker is not
+      # consuming messages.
+      MessageRetentionPeriod: 345600
+
+      # ── Redrive policy — connects this queue to the DLQ ──────────────────
+      # After MaxReceiveCount failed attempts, SQS automatically moves the
+      # message to the deadLetterTargetArn queue (our DLQ above).
+      #
+      # WHAT COUNTS AS A FAILED ATTEMPT:
+      #   A message is "received" when Lambda polls and gets it. If Lambda
+      #   crashes, throws an unhandled exception, or times out, it does NOT
+      #   call DeleteMessage. SQS waits for VisibilityTimeout to expire,
+      #   then makes the message visible again (increments ApproximateReceiveCount).
+      #   Once ApproximateReceiveCount >= maxReceiveCount, the redrive kicks in.
+      #
+      # maxReceiveCount=5:
+      #   5 retry attempts gives the system several chances to recover from:
+      #   - Transient network errors
+      #   - Temporary database unavailability
+      #   - Lambda cold start timeouts
+      #   But prevents an infinite retry loop on a truly unprocessable message
+      #   (corrupted file, unexpected format) from clogging the queue forever.
+      #
+      # NOTE: The DLQ ARN is resolved via !GetAtt — CloudFormation ensures
+      # the DLQ exists before the main queue is created.
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CSVForgeJobsDLQ.Arn
+        maxReceiveCount: 5
+
+Outputs:
+  MainQueueUrl:
+    Description: >
+      URL of the main SQS queue. Used in:
+        - SQS_QUEUE_URL env var in .env / Lambda config
+        - send_job_message(queue_url=...) in sqs_client.py
+        - aws sqs send-message --queue-url <this URL>
+      Format: https://sqs.{region}.amazonaws.com/{account-id}/{queue-name}
+    Value: !Ref CSVForgeJobsQueue
+    Export:
+      Name: !Sub "${AWS::StackName}-MainQueueUrl"
+
+  MainQueueArn:
+    Description: >
+      ARN of the main SQS queue. Used in:
+        - Lambda event source mapping (the Lambda trigger configuration)
+        - IAM policy Resource field for sqs:SendMessage, sqs:ReceiveMessage
+      Format: arn:aws:sqs:{region}:{account-id}:{queue-name}
+    Value: !GetAtt CSVForgeJobsQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MainQueueArn"
+
+  DlqUrl:
+    Description: URL of the Dead-Letter Queue. Used for monitoring and manual replay.
+    Value: !Ref CSVForgeJobsDLQ
+    Export:
+      Name: !Sub "${AWS::StackName}-DlqUrl"
+
+  DlqArn:
+    Description: >
+      ARN of the Dead-Letter Queue. Used in CloudWatch alarms:
+        aws cloudwatch put-metric-alarm \
+          --alarm-name csvforge-dlq-messages \
+          --metric-name ApproximateNumberOfMessagesVisible \
+          --namespace AWS/SQS \
+          --dimensions Name=QueueName,Value=csvforge-jobs-dev-dlq \
+          --evaluation-periods 1 --threshold 1 --comparison-operator GreaterThanOrEqualToThreshold \
+          --alarm-actions <SNS_ARN>
+      Set this alarm so the team is paged when a message first lands in the DLQ.
+    Value: !GetAtt CSVForgeJobsDLQ.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DlqArn"
