@@ -1,0 +1,33 @@
+{
+  "project_type": "FastAPI backend + SQLAlchemy ORM + Python worker Lambda (placeholder) + Docker Compose for local dev",
+  "language": "Python 3.14",
+  "build_system": "pip with exact-pinned requirements.txt files; no build system (no pyproject.toml, no Makefile). Backend and worker are separate pip environments sharing the same Python venv locally.",
+  "test_framework": "pytest 9.1.1 with moto[s3,sqs]==5.2.3 for AWS mocking. Unit tests use SQLite in-memory. Integration tests use real Docker PostgreSQL.",
+  "build_command": "No compile step. Python is interpreted.",
+  "test_command": "cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/ -v",
+  "verification_instructions": "1. Run all unit tests: cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/ -v (must pass 53 existing + all new tests). 2. Run integration tests (requires Docker): docker compose up -d && alembic upgrade head && PYTHONPATH=. .venv/bin/pytest tests/integration/ -v. 3. No new Alembic migration is needed for Day 2.",
+  "snapshot_or_generated_files": null,
+  "environment_constraints": "AWS credentials are currently invalid (InvalidClientTokenId on aws sts get-caller-identity). FEAT-001 (AWS resource creation) must be attempted with a note that the implementer must fix credentials first. Region is ap-south-1. The .venv lives at /Users/vishal/csv-metadata/.venv. PYTHONPATH must be set to the project root for imports to resolve. The no-behavior-changes steering rule means: do NOT change function signatures, SQL queries, package versions, or test names in existing files.",
+  "contribution_requirements": "Per .kiro/steering/documentation-style.md: ALL new Python files must have full educational docstrings explaining WHY, not just WHAT. Every function needs a docstring with WHAT/WHY/HOW sections. Per .kiro/steering/no-behavior-changes.md: do not change existing function signatures, SQL, package versions, or test names. Per .kiro/steering/architecture.md: PYTHONPATH=. must be set for all test runs.",
+  "key_patterns": "1. Repository pattern: all DB ops in job_repository.py, never raw SQL in routes. 2. Conditional UPDATE for idempotency (claim_job_for_processing). 3. get_db() FastAPI dependency yields one session per request. 4. Local dev uses X-Dev-User-Id / X-Dev-User-Email headers instead of JWT when ENVIRONMENT=local. 5. worker/ imports from backend.db and backend.models (AD-28). 6. moto decorators used in unit tests — see test_job_repository_unit.py for fixture pattern. 7. expire_on_commit=False on SessionLocal. 8. All new test files follow the class-based grouping pattern (class TestXxx: / def test_yyy(self, sqlite_db)). 9. Comment style: explain WHY with restaurant/warehouse analogies where appropriate.",
+  "relevant_files": [
+    "backend/main.py",
+    "backend/db/connection.py",
+    "backend/db/job_repository.py",
+    "backend/models/job.py",
+    "backend/requirements.txt",
+    "backend/requirements-dev.txt",
+    "worker/__init__.py",
+    "worker/requirements.txt",
+    "tests/conftest.py",
+    "tests/unit/test_job_repository_unit.py",
+    "tests/unit/test_health.py",
+    ".env.example",
+    ".env",
+    "docker-compose.yml",
+    "docs/DECISIONS.md",
+    ".kiro/steering/documentation-style.md",
+    ".kiro/steering/no-behavior-changes.md"
+  ],
+  "directory_structure": "csv-metadata/ root: backend/ (FastAPI app, db/, models/, alembic/), worker/ (placeholder Lambda), tests/ (unit/ SQLite-based, integration/ PostgreSQL-based), infrastructure/ (empty, .gitkeep only), docs/ (DECISIONS.md, PROGRESS.md, VERSIONS.md), .kiro/steering/ (3 steering files), .venv/ (Python venv), .agents/tasks/ (artifacts dir, never committed)"
+}

@@ -1,0 +1,7 @@
+{
+  "task_id": "task-day2-csvforge",
+  "task_description": "Transform CSVForge from a local FastAPI/PostgreSQL app into a distributed AWS system. Create real AWS resources (S3 bucket, SQS queue + DLQ) in ap-south-1, implement the S3 and SQS client wrappers, implement the CSV processing pipeline (parser + cleaner), add the FastAPI upload endpoints (presigned URL generation + upload confirmation), and implement the worker Lambda handler skeleton.",
+  "status": "pending",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003"],
+  "blocked_reason": null
+}

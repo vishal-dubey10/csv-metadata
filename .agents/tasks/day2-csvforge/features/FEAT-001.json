@@ -1,0 +1,35 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "AWS resource creation + S3 and SQS client wrappers. Create real AWS resources in ap-south-1 (S3 bucket csvforge-files-dev, SQS queue csvforge-jobs-dev, DLQ csvforge-jobs-dev-dlq), capture them in CloudFormation YAML, then implement backend/s3_client.py and backend/sqs_client.py with full moto-based unit tests. IMPORTANT: the current AWS credentials in ~/.aws/credentials are invalid (aws sts get-caller-identity returns InvalidClientTokenId). Before creating any AWS resource, run aws sts get-caller-identity and confirm a valid JSON response. If credentials are still invalid, document the error in findings and skip the actual resource creation CLI steps — but still write the CloudFormation YAML and the client code (they do not require live AWS to be tested, because moto mocks are used in unit tests).",
+  "status": "completed",
+  "steps": [
+    "Step 1: Verify AWS credentials — run `aws sts get-caller-identity`. If valid, record Account ID, UserId, Arn in findings. If invalid, record the error, skip CLI resource creation, and continue with code-only steps.",
+    "Step 2 (CLI, only if credentials valid): Create S3 bucket `csvforge-files-dev` in ap-south-1 with all public access blocked. Run: `aws s3api create-bucket --bucket csvforge-files-dev --region ap-south-1 --create-bucket-configuration LocationConstraint=ap-south-1` then `aws s3api put-public-access-block --bucket csvforge-files-dev --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true`.",
+    "Step 3 (CLI, only if credentials valid): Add S3 CORS for browser direct upload. Put the JSON [{\"AllowedHeaders\":[\"*\"],\"AllowedMethods\":[\"PUT\"],\"AllowedOrigins\":[\"http://localhost:5173\"],\"ExposeHeaders\":[\"ETag\"]}] via `aws s3api put-bucket-cors --bucket csvforge-files-dev --cors-configuration <json>`.",
+    "Step 4 (CLI, only if credentials valid): Create DLQ first. Run: `aws sqs create-queue --queue-name csvforge-jobs-dev-dlq --region ap-south-1 --attributes MessageRetentionPeriod=345600`. Record the DLQ ARN from the response.",
+    "Step 5 (CLI, only if credentials valid): Create main SQS queue with redrive policy pointing at the DLQ. VisibilityTimeout=1800, MaxReceiveCount=5. Record the queue URL.",
+    "Step 6: Write `infrastructure/data.yaml` — CloudFormation template with AWS::S3::Bucket resource (BucketName: csvforge-files-dev, BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true, CorsConfiguration with PUT allowed from http://localhost:5173). Include educational comments explaining each property.",
+    "Step 7: Write `infrastructure/queues.yaml` — CloudFormation template with two AWS::SQS::Queue resources (DLQ: csvforge-jobs-dev-dlq with MessageRetentionPeriod 4 days; Main: csvforge-jobs-dev with VisibilityTimeout 1800, MessageRetentionPeriod 4 days, RedrivePolicy referencing the DLQ with maxReceiveCount 5). Include educational comments explaining VisibilityTimeout, DLQ, MaxReceiveCount per AD-17.",
+    "Step 8: Write `backend/s3_client.py` — implement get_s3_client(), generate_presigned_upload_url(bucket, key, expiry_seconds=900) with content-length-range [0, 52428800], generate_presigned_download_url(bucket, key, expiry_seconds=900), object_exists(bucket, key) -> bool, get_object_size(bucket, key) -> int, upload_file(bucket, key, file_path) -> None, download_file(bucket, key, dest_path) -> None. Full educational docstrings per documentation-style.md. The client reads AWS_ENDPOINT_URL from env for optional LocalStack override.",
+    "Step 9: Write `backend/sqs_client.py` — implement get_sqs_client(), send_job_message(queue_url, job_id, s3_key) -> str, parse_job_message(body: str) -> dict. Message body is JSON with job_id and s3_key only (never file content). Full educational docstrings.",
+    "Step 10: Write `tests/unit/test_s3_client.py` — moto[s3] based tests: generate_presigned_upload_url returns URL with bucket+key, object_exists True/False, get_object_size returns correct bytes, upload_file+download_file round-trip without data corruption. Use @mock_aws decorator (moto 5.x) and create the bucket before each test.",
+    "Step 11: Write `tests/unit/test_sqs_client.py` — moto[sqs] based tests: send_job_message returns a message ID string, parse_job_message returns correct job_id and s3_key, round-trip send+receive+parse preserves values. Use @mock_aws decorator and create the queue before each test.",
+    "Step 12: Update `.env` with S3_BUCKET_NAME=csvforge-files-dev, SQS_QUEUE_URL=https://sqs.ap-south-1.amazonaws.com/{account_id}/csvforge-jobs-dev (use placeholder account ID if credentials were invalid), AWS_DEFAULT_REGION=ap-south-1."
+  ],
+  "acceptance_criteria": [
+    "Running `PYTHONPATH=. .venv/bin/pytest tests/unit/test_s3_client.py tests/unit/test_sqs_client.py -v` passes all new tests",
+    "Running `PYTHONPATH=. .venv/bin/pytest tests/unit/ -v` still passes all 53 existing tests plus new ones (no regressions)",
+    "backend/s3_client.py exists with all 7 functions documented with WHY/HOW/ANALOGY docstrings",
+    "backend/sqs_client.py exists with all 3 functions documented with WHY/HOW docstrings",
+    "infrastructure/data.yaml exists with S3 bucket CloudFormation resource and CORS config",
+    "infrastructure/queues.yaml exists with both SQS queue CloudFormation resources and redrive policy",
+    "If AWS credentials were valid: aws s3 ls s3://csvforge-files-dev succeeds; aws sqs get-queue-url --queue-name csvforge-jobs-dev returns the queue URL"
+  ],
+  "verification": [
+    "cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/test_s3_client.py tests/unit/test_sqs_client.py -v",
+    "cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/ -v (all existing 53 + new tests pass)"
+  ],
+  "blocked_reason": null,
+  "findings": "AWS credentials status: INVALID — aws sts get-caller-identity returned InvalidClientTokenId (confirmed at step execution time). CLI resource creation steps (Steps 2-5) were skipped. All code-only steps completed. Files created: infrastructure/data.yaml (CloudFormation S3 bucket with CORS, encryption, public access block), infrastructure/queues.yaml (CloudFormation DLQ + main SQS queue with redrive policy), backend/s3_client.py (7 functions: get_s3_client, generate_presigned_upload_url, generate_presigned_download_url, object_exists, get_object_size, upload_file, download_file), backend/sqs_client.py (3 functions: get_sqs_client, send_job_message, parse_job_message), tests/unit/test_s3_client.py (18 tests across 5 classes), tests/unit/test_sqs_client.py (13 tests across 3 classes). .env updated: AWS_DEFAULT_REGION=ap-south-1, SQS_QUEUE_URL=https://sqs.ap-south-1.amazonaws.com/ACCOUNT_ID_PLACEHOLDER/csvforge-jobs-dev, S3_BUCKET_NAME=csvforge-files-dev (already set). Test results: 84/84 unit tests passing (53 original + 31 new). No regressions."
+}
