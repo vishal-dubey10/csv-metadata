@@ -128,3 +128,105 @@ Region: `ap-south-1` (Mumbai) — all resources in one region (AD-D2-01).
 - **CloudFormation stacks** — `network.yaml` (VPC, subnets, security groups), `compute.yaml` (Lambda functions, API Gateway)
 - **CI/CD pipeline** — CodeBuild buildspec.yml (test → build Docker image → push ECR), CodePipeline (source → build → deploy)
 
+
+---
+
+## Days 3 & 4 — CSV Processing Pipeline, API, Authentication, and Authorization
+
+**Completed:** October 9, 2026
+
+### What Was Built
+
+**CSV Processing Pipeline (Day 3)**
+
+`worker/csv_processor.py` — `parse_and_analyse()` with full AD-21 validation contract, `clean()` with trim-before-dedup ordering, `write_csv()` with RFC 4180 CRLF output. Pure Python, no AWS dependencies.
+
+`worker/handler.py` — 12-step pipeline: parse SQS → open DB → claim job (conditional UPDATE) → download from S3 → validate/parse CSV → clean → write /tmp → upload to S3 (before DB, AD-14) → update DB to completed. Permanent failures (InvalidCSVError) return cleanly; transient failures re-raise so SQS retries.
+
+`worker/Dockerfile` — Lambda container image using `public.ecr.aws/lambda/python:3.14`. Build context is project root (not `./worker/`) per AD-18. Copies backend/ shared modules into LAMBDA_TASK_ROOT.
+
+**API Layer (Day 4)**
+
+`backend/schemas.py` — Added `JobResponse`, `JobListResponse`, `JobDownloadResponse`, `PostJobRequest`, `AdminJobResponse`. All use `from_attributes=True` for ORM compatibility.
+
+`backend/auth.py` — `CurrentUser` dataclass, `get_current_user()` dependency (local bypass via `X-Dev-User-Id` header; production reads API Gateway JWT claims from `scope["aws.event"]["requestContext"]["authorizer"]["jwt"]["claims"]`), `require_admin()` dependency.
+
+`backend/main.py` — Complete rewrite. All endpoints:
+- `GET /health` (public)
+- `POST /jobs` → 201 (REST alias for upload intent)
+- `POST /uploads/intent` → 200 (original route, backwards-compatible)
+- `POST /uploads/{job_id}/complete` → 200/404/422/409
+- `GET /jobs` → 200 (ownership-filtered list, pending_upload excluded per AD-13)
+- `GET /jobs/{job_id}` → 200/404 (ownership-checked, 404 for wrong owner per AD-13)
+- `GET /jobs/{job_id}/download` → 200/404/409 (completed-only presigned URL)
+- `GET /admin/jobs` → 200/403 (admin-only, Content-Range header for React Admin)
+
+**Infrastructure (CloudFormation templates prepared, not yet deployed)**
+
+`infrastructure/network.yaml` — VPC, 2 private subnets, Lambda/RDS/VPCEndpoint security groups, S3 gateway endpoint (free), SQS and Secrets Manager interface endpoints (AD-15).
+
+`infrastructure/api.yaml` — Cognito User Pool + App Client + Admin Group, API Lambda (zip, python3.14), API Gateway HTTP API, JWT Authoriser, Lambda permission.
+
+`infrastructure/worker.yaml` — ECR repository with lifecycle policy, Worker Lambda (container image, 1024 MB, 300s timeout), SQS event source mapping (BatchSize=1 per AD-07).
+
+### Unit Test Count
+
+**197 tests** — all passing. Run with:
+```
+cd /Users/vishal/csv-metadata && PYTHONPATH=. .venv/bin/pytest tests/unit/ -v
+```
+
+New test files added:
+- `tests/unit/test_job_endpoints.py` — 38 tests for all new job endpoints including IDOR regression tests
+- `tests/unit/test_auth.py` — 28 tests for the auth dependency (local bypass, production JWT claims, require_admin, cross-user ownership)
+
+### Issues Found and Fixed During Testing
+
+1. `asyncio.get_event_loop()` removed in Python 3.14 → replaced with `asyncio.run()` in `test_auth.py`
+2. SQLite cannot bind Python `list` in a Core `UPDATE` statement (ARRAY `.with_variant()` only affects DDL) → `column_names=None` in unit test helpers; ARRAY tests belong in integration tests
+3. SQLite `CURRENT_TIMESTAMP` has 1-second granularity → ordering assertion made order-agnostic
+
+### Files Created / Modified in Days 3 & 4
+
+**New files:**
+- `worker/Dockerfile` — Lambda container image build
+- `backend/auth.py` — authentication dependency
+- `infrastructure/network.yaml` — VPC and networking
+- `infrastructure/api.yaml` — API Lambda and API Gateway
+- `infrastructure/worker.yaml` — Worker Lambda and ECR
+- `tests/unit/test_job_endpoints.py` — job endpoint tests
+- `tests/unit/test_auth.py` — auth dependency tests
+- `docs/DAY3_LEARNING_GUIDE.md` — Day 3 architecture guide
+- `docs/DAY4_LEARNING_GUIDE.md` — Day 4 architecture guide
+
+**Modified files:**
+- `backend/main.py` — complete rewrite with all endpoints
+- `backend/schemas.py` — added job response schemas
+- `.env.example` — fixed ap-south-1 regions, added Cognito vars
+
+### AWS Resources (not yet deployed — pending Day 5/6)
+
+| Stack | Resources | Status |
+|---|---|---|
+| csvforge-network-dev | VPC, subnets, SGs, VPC endpoints | Template ready |
+| csvforge-api-dev | Cognito, API Lambda, API Gateway | Template ready |
+| csvforge-worker-dev | ECR, Worker Lambda, ESM | Template ready |
+| csvforge-data-dev | S3 bucket | Deployed (Day 2) |
+| csvforge-queues-dev | SQS + DLQ | Deployed (Day 2) |
+
+### Known Blockers (AWS Verification Phase)
+
+- **RDS PostgreSQL:** Lambda worker requires RDS in the same VPC. Local Docker PostgreSQL is not reachable from Lambda. RDS provisioning is a Day 5/6 task.
+- **Cognito User Pool:** JWT validation in API Gateway requires a real Cognito User Pool ID and App Client ID. Local dev uses `X-Dev-User-Id` bypass.
+- **ECR image push:** Worker Lambda needs the Docker image pushed to ECR before deployment.
+- **Actual SQS → Lambda → S3 → DB end-to-end:** Requires all above plus deployed CloudFormation stacks.
+
+### What Days 5 & 6 Should Tackle
+
+- CloudFormation network stack deployment (VPC, subnets, SGs, endpoints)
+- RDS instance provisioning (db.t3.micro, PostgreSQL 16, private subnet)
+- Alembic migration against real RDS
+- Cognito User Pool creation and test user setup
+- ECR repository creation and worker Docker image push
+- API Lambda zip packaging and deployment
+- End-to-end smoke test: upload CSV → SQS message → Lambda processes → download result

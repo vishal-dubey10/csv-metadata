@@ -560,3 +560,47 @@ A transactional outbox pattern would write the SQS message intent to the databas
 
 **Production path:** Separate buckets per principle of least privilege — the Lambda worker's role would have no access to the uploads bucket at all, only the processed bucket. For MVP, the complexity is not justified.
 
+
+---
+
+## AD-D4-01 — 404 for wrong-owner job requests (not 403)
+
+**Decision:** `GET /jobs/{job_id}` and `GET /jobs/{job_id}/download` return 404 when the job exists but belongs to a different user.
+
+**Rationale:** Returning 403 would reveal that the job *exists* — the caller could enumerate job IDs and learn which ones are owned by other users. With 404 for both "does not exist" and "wrong owner," an attacker learns nothing from a failed request. This is the standard IDOR-prevention pattern.
+
+**Trade-off:** Legitimate users occasionally get a confusing "not found" message when they paste the wrong job ID. Security benefit outweighs the UX cost for an MVP.
+
+**Scope:** User-facing endpoints only. `GET /admin/jobs` uses 403 because `/admin/jobs` is a publicly known path — there is no enumeration risk in confirming it exists.
+
+---
+
+## AD-D4-02 — API Gateway validates JWT; FastAPI reads already-validated claims
+
+**Decision:** FastAPI does not validate JWT signatures, expiry, or issuer. These are validated by the API Gateway JWT Authoriser. FastAPI reads already-validated claims from `scope["aws.event"]["requestContext"]["authorizer"]["jwt"]["claims"]`.
+
+**Rationale:** API Gateway JWT Authorisers handle JWKS key discovery, caching, signature verification, and claim validation automatically. Duplicating this in FastAPI would: (1) require downloading/caching Cognito JWKS on every Lambda cold start, (2) add Lambda execution time per request, (3) duplicate logic that API Gateway already provides reliably.
+
+**Local dev bypass:** `ENVIRONMENT=local` → FastAPI reads `X-Dev-User-Id` and `X-Dev-Is-Admin` headers. The bypass is gated strictly by the environment variable and never runs in production (where `ENVIRONMENT=production`).
+
+**Reference:** AD-19 (detailed JWT claims path), AD-23 (access token claims).
+
+---
+
+## AD-D4-03 — POST /jobs returns 201, POST /uploads/intent returns 200
+
+**Decision:** The new `POST /jobs` route returns 201 Created. The original `POST /uploads/intent` route retains its 200 OK response for backwards compatibility.
+
+**Rationale:** 201 Created is semantically correct for a resource-creation endpoint — a new Job record is created in the database. The `/uploads/intent` route was created before this naming convention was applied and is referenced in all existing tests and documentation; changing it to 201 would break those tests and documentation references unnecessarily.
+
+**Both routes accept the same request body and return the same response shape.** They share the `_create_upload_job_logic()` private function.
+
+---
+
+## AD-D4-04 — Column names in ARRAY column not bindable in SQLite Core UPDATE
+
+**Decision:** Unit tests pass `column_names=None` to `complete_job()`. Tests for ARRAY column storage belong in the PostgreSQL integration test suite.
+
+**Rationale:** SQLAlchemy's `ARRAY(TEXT).with_variant(TEXT, "sqlite")` only affects the DDL type mapping (column creation). When a Core `update().values(column_names=[...])` is executed, SQLite's parameter binding receives a Python `list` object, which SQLite does not support natively. In the PostgreSQL path, ARRAY binds correctly. This is an expected limitation of the SQLite unit test environment and is documented in code comments.
+
+**Existing coverage:** `tests/integration/test_job_repository_integration.py` contains PostgreSQL-specific ARRAY tests.

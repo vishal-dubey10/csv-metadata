@@ -1,0 +1,382 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge Network Layer — VPC, subnets, security groups, and VPC endpoints.
+
+  WHAT THIS TEMPLATE DOES:
+    Creates the foundational network infrastructure that every other CSVForge
+    stack depends on. All Lambda functions and the RDS instance run inside
+    this VPC to prevent public internet exposure.
+
+  WHY A VPC (and not just public resources):
+    S3 and SQS are fully accessible from the internet — but RDS (PostgreSQL)
+    is NOT something you want publicly accessible. Placing RDS inside a VPC
+    with no public IP means it can only be reached by resources in the same
+    VPC (the Lambda functions). This is the standard "private database" pattern.
+
+    Placing Lambda inside the VPC also enables it to reach RDS directly over
+    private IP without a proxy — and to reach S3/SQS/Secrets Manager via VPC
+    endpoints (no internet gateway, no NAT gateway, no data transfer charges).
+
+  NETWORKING OVERVIEW:
+
+    Internet Gateway  (attached to the VPC — required for public subnets,
+                       even though we don't use public subnets for Lambda/RDS)
+          │
+    VPC (10.0.0.0/16)
+    │
+    ├── Private Subnet AZ-A (10.0.1.0/24)  — Lambda, RDS
+    │       Route table: local + S3 gateway endpoint
+    │
+    └── Private Subnet AZ-B (10.0.2.0/24)  — Lambda, RDS
+            Route table: local + S3 gateway endpoint
+
+    VPC Endpoints:
+      S3 Gateway Endpoint     — free; routes S3 traffic within AWS backbone
+      SQS Interface Endpoint  — PrivateLink; ~$0.01/hr per AZ × 2 AZs
+      Secrets Manager Endpoint— PrivateLink; ~$0.01/hr per AZ × 2 AZs
+
+    NO NAT GATEWAY:
+      Lambda reaches all AWS services via VPC endpoints. No internet egress
+      is needed, so no NAT gateway is provisioned. This saves ~$0.045/hr
+      (~$33/month) for a development environment. (AD-15)
+
+  ANALOGY — VPC as a private office building:
+    The VPC is a private office building. Subnets are floors. Security groups
+    are door locks. The internet gateway is the lobby entrance for public traffic.
+    VPC endpoints are internal corridors to AWS services — you can reach the
+    S3 "post room" or SQS "message board" without going through the lobby.
+    Lambda functions and RDS live on private floors with no public elevator.
+
+  HOW TO DEPLOY:
+    aws cloudformation deploy \
+      --template-file infrastructure/network.yaml \
+      --stack-name csvforge-network-dev \
+      --region ap-south-1
+
+  IMPORTANT CONCEPTS:
+    CIDR notation:
+      10.0.0.0/16 means: first 16 bits are fixed (10.0), last 16 bits are
+      available for hosts. Total IPs = 2^16 = 65,536. Within this VPC,
+      individual subnets use /24 notation (256 IPs each).
+    Availability Zones (AZs):
+      Independent data centres within a region. Using two AZs for subnets
+      satisfies AWS's requirement for RDS subnet groups and provides basic
+      fault tolerance for Lambda (Lambda automatically runs in multiple AZs
+      if you configure multiple subnets).
+    Security group:
+      A stateful virtual firewall for AWS resources (Lambda, RDS). "Stateful"
+      means: if you allow outbound traffic on port X, the return traffic on
+      the same connection is automatically allowed (no explicit inbound rule
+      needed for response packets).
+
+  See AD-15 in docs/DECISIONS.md for the VPC endpoint strategy.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: CIDR block for the VPC. /16 gives 65,536 IPs — more than enough.
+
+  PrivateSubnetACidr:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: CIDR for private subnet in AZ-A (256 IPs; Lambda and RDS).
+
+  PrivateSubnetBCidr:
+    Type: String
+    Default: "10.0.2.0/24"
+    Description: CIDR for private subnet in AZ-B (256 IPs; Lambda and RDS).
+
+Resources:
+
+  # ── VPC ────────────────────────────────────────────────────────────────────
+  # The VPC is the private network container. All subnets, route tables,
+  # security groups, and endpoints belong to this VPC.
+  #
+  # EnableDnsSupport + EnableDnsHostnames:
+  #   Required for VPC interface endpoints (SQS, Secrets Manager) to work.
+  #   With these enabled, resources in the VPC can resolve endpoint DNS names
+  #   (e.g., sqs.ap-south-1.amazonaws.com) to the private IP of the VPC
+  #   interface endpoint rather than the public internet address.
+  #   Without these, Lambda would not be able to reach SQS via the endpoint.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: csvforge-vpc-dev
+
+  # ── Private Subnets ────────────────────────────────────────────────────────
+  # Two private subnets in separate AZs.
+  #
+  # MapPublicIpOnLaunch: false
+  #   Resources in these subnets do NOT receive public IP addresses.
+  #   This is what makes them "private" — there is no direct inbound path
+  #   from the internet. Lambda and RDS here are only reachable from within
+  #   the VPC.
+  #
+  # WHY TWO AZS:
+  #   1. AWS requires an RDS DB subnet group to span at least 2 AZs, even
+  #      for a Single-AZ instance (AD-25).
+  #   2. Lambda automatically distributes invocations across all subnets you
+  #      configure — two subnets in separate AZs provides basic resilience.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: csvforge-private-subnet-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: csvforge-private-subnet-b
+
+  # ── Route Tables ──────────────────────────────────────────────────────────
+  # Route tables control where network traffic is directed.
+  # Private subnets have only a local route (within the VPC).
+  # S3 gateway endpoint routes are added to these tables below.
+  #
+  # WHY SEPARATE ROUTE TABLES PER SUBNET:
+  #   AWS best practice — one route table per subnet allows independent
+  #   routing configuration. If we added a NAT gateway only in AZ-A, we
+  #   could route AZ-A subnet through it while AZ-B stays private.
+  #   For our no-NAT setup, both tables are identical — but the structure
+  #   is correct for future changes.
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: csvforge-private-rt-a
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: csvforge-private-rt-b
+
+  # Associate each subnet with its route table.
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+
+  # Lambda Security Group:
+  #   Allows all outbound traffic (Lambda initiates all connections — to S3,
+  #   SQS, Secrets Manager via VPC endpoints, and to RDS).
+  #   No inbound rules — Lambda is never "connected to" from the outside;
+  #   it only initiates outbound connections.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for API and Worker Lambda functions
+      VpcId: !Ref VPC
+      # Egress: allow all outbound traffic.
+      # Lambda needs to connect to:
+      #   - RDS on port 5432 (PostgreSQL)
+      #   - SQS interface endpoint on port 443
+      #   - Secrets Manager interface endpoint on port 443
+      #   - S3 gateway endpoint (no port restriction; uses route table)
+      # Rather than opening specific ports (which would require knowing all
+      # destination IPs upfront), we allow all egress and rely on target
+      # security groups to restrict inbound access.
+      SecurityGroupEgress:
+        - IpProtocol: "-1"  # all protocols
+          CidrIp: "0.0.0.0/0"
+          Description: Allow all outbound traffic (to VPC endpoints and RDS)
+      Tags:
+        - Key: Name
+          Value: csvforge-lambda-sg
+
+  # RDS Security Group:
+  #   Allows inbound PostgreSQL (port 5432) from the Lambda security group.
+  #   No outbound rules needed — RDS only responds to inbound connections.
+  #
+  # WHY SOURCE SECURITY GROUP (not CIDR range):
+  #   Using the Lambda security group ID as the source (SourceSecurityGroupId)
+  #   is more precise than opening port 5432 to the entire VPC CIDR.
+  #   Only Lambda functions in LambdaSecurityGroup can reach RDS — no other
+  #   VPC resource (a developer's EC2 bastion, another Lambda, etc.) can
+  #   connect unless explicitly added to LambdaSecurityGroup.
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS PostgreSQL instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Allow PostgreSQL from Lambda functions
+      Tags:
+        - Key: Name
+          Value: csvforge-rds-sg
+
+  # VPC Endpoint Security Group:
+  #   Applied to SQS and Secrets Manager interface endpoints.
+  #   Allows HTTPS (port 443) from Lambda security group.
+  #   Interface endpoints present as ENIs (Elastic Network Interfaces)
+  #   in the subnet with their own security groups.
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC interface endpoints (SQS, Secrets Manager)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Allow HTTPS from Lambda functions to VPC endpoints
+      Tags:
+        - Key: Name
+          Value: csvforge-vpce-sg
+
+  # ── S3 Gateway Endpoint ───────────────────────────────────────────────────
+  # Gateway endpoints route S3 traffic through the AWS backbone without
+  # a NAT gateway. They are FREE (no hourly charge, no data processing charge).
+  #
+  # HOW IT WORKS:
+  #   The endpoint adds a route to the specified route tables:
+  #   Destination: pl-XXXXX (S3 prefix list — a managed set of S3 IP ranges)
+  #   Target: the gateway endpoint
+  #   Traffic to S3 IPs is routed through the AWS internal backbone, not
+  #   through the internet. No NAT gateway needed.
+  #
+  # WHY GATEWAY (not Interface) FOR S3:
+  #   S3 supports both types. Gateway is free; Interface costs ~$0.01/hr per AZ.
+  #   For S3, use Gateway. For SQS and Secrets Manager (which only support
+  #   Interface), use Interface endpoints. AD-15.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref VPC
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTableA
+        - !Ref PrivateRouteTableB
+      # No security group for gateway endpoints (only interface endpoints have SGs).
+      # Access is controlled by the endpoint policy below.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:HeadObject"
+            Resource: "*"
+            # In production: restrict Resource to the specific bucket ARN.
+            # For development simplicity, allow all S3 access through this endpoint.
+
+  # ── SQS Interface Endpoint ────────────────────────────────────────────────
+  # Interface endpoints (PrivateLink) create ENIs in your subnets.
+  # Lambda traffic destined for SQS resolves to these ENI IPs rather than
+  # SQS's public internet addresses.
+  #
+  # Cost: ~$0.01/hr per AZ × 2 AZs = $0.02/hr ≈ $14/month. Required for
+  # no-NAT Lambda → SQS connectivity. AD-15.
+  SQSInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sqs"
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      # PrivateDnsEnabled: Lambda resolves sqs.ap-south-1.amazonaws.com to
+      # the private ENI IP (not the public SQS IP). This means no code changes
+      # in the application — the same boto3 call works with or without the endpoint.
+      PrivateDnsEnabled: true
+
+  # ── Secrets Manager Interface Endpoint ───────────────────────────────────
+  # Lambda reads the DB password from Secrets Manager at cold start.
+  # Without this endpoint, Lambda would need internet access (via NAT) to
+  # reach Secrets Manager. This endpoint routes that call privately.
+  SecretsManagerInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+Outputs:
+  VpcId:
+    Description: VPC ID — used by all other stacks that create VPC resources.
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  PrivateSubnetAId:
+    Description: Private subnet A — used by Lambda and RDS subnet group.
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnetAId"
+
+  PrivateSubnetBId:
+    Description: Private subnet B — used by Lambda and RDS subnet group.
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnetBId"
+
+  LambdaSecurityGroupId:
+    Description: Security group ID for Lambda functions.
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaSecurityGroupId"
+
+  RDSSecurityGroupId:
+    Description: Security group ID for the RDS instance.
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSSecurityGroupId"
+
+  PrivateRouteTableAId:
+    Description: Route table ID for private subnet A (for reference).
+    Value: !Ref PrivateRouteTableA
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateRouteTableAId"
+
+  PrivateRouteTableBId:
+    Description: Route table ID for private subnet B (for reference).
+    Value: !Ref PrivateRouteTableB
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateRouteTableBId"

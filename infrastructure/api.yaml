@@ -1,0 +1,514 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge API Layer — API Lambda function, API Gateway HTTP API, and Cognito User Pool.
+
+  WHAT THIS TEMPLATE DOES:
+    Creates the application-layer infrastructure for the CSVForge REST API:
+      1. Cognito User Pool + App Client — user authentication
+      2. Cognito User Pool Group — admin access control
+      3. Lambda function (zip package) — hosts the FastAPI/Mangum app
+      4. Lambda IAM execution role — least-privilege permissions
+      5. API Gateway HTTP API — routes browser requests to Lambda
+      6. API Gateway JWT Authoriser — validates Cognito access tokens
+      7. Lambda permission — allows API Gateway to invoke the Lambda
+
+  DEPENDENCY ORDERING (deploy after these stacks):
+    1. csvforge-network-dev  (VPC, subnets, security groups)
+    2. csvforge-data-dev     (S3 bucket)
+    3. csvforge-queues-dev   (SQS queue)
+    This stack imports Outputs from all three stacks via Fn::ImportValue.
+
+  HOW API REQUESTS FLOW:
+
+    Browser
+      │ HTTPS request (Authorization: Bearer <access_token>)
+      ▼
+    API Gateway (HTTP API)
+      │ JWT Authoriser: validates token against Cognito JWKS
+      │   - Verifies signature
+      │   - Verifies iss = https://cognito-idp.{region}.amazonaws.com/{pool_id}
+      │   - Verifies exp (not expired)
+      │   - Verifies aud / client_id
+      │ On failure → 401 (FastAPI never runs)
+      │ On success → injects decoded claims into event.requestContext.authorizer.jwt
+      ▼
+    Lambda (API function)
+      │ Mangum translates API Gateway event → ASGI request
+      │ FastAPI reads claims from scope["aws.event"]["requestContext"]["authorizer"]["jwt"]["claims"]
+      │ get_current_user() extracts user_id from sub claim
+      ▼
+    FastAPI route handler → repository → PostgreSQL (RDS, private subnet)
+
+  AUTHENTICATION FLOW (Cognito Hosted UI or custom login):
+    1. Frontend redirects to Cognito Hosted UI (or calls InitiateAuth API).
+    2. User signs in — Cognito issues ID Token + Access Token + Refresh Token.
+    3. Frontend stores tokens in memory (not localStorage — XSS risk, AD-10).
+    4. All API requests include: Authorization: Bearer <access_token>.
+    5. API Gateway JWT Authoriser validates the access token.
+    6. FastAPI reads the validated claims from the event context.
+
+  IMPORTANT CONCEPTS:
+    HTTP API (not REST API):
+      API Gateway offers two flavors. HTTP API is the modern, lower-latency,
+      lower-cost option. REST API adds features like API keys, usage plans,
+      request validation, and transformation. For CSVForge (JWT auth, simple
+      proxy to Lambda), HTTP API is sufficient and ~70% cheaper.
+    JWT Authoriser (not Lambda Authoriser):
+      A JWT Authoriser validates tokens against a JWKS endpoint automatically —
+      no Lambda needed, no custom code. It is specifically designed for Cognito
+      (and any OIDC provider). Lambda Authorisers are for custom auth logic
+      (database lookup, API keys). For Cognito JWTs, use the JWT Authoriser.
+    Payload format version 2.0:
+      HTTP API sends events to Lambda in format 2.0. The JWT claims are at
+      event.requestContext.authorizer.jwt.claims. Mangum 0.22.0 maps this
+      to scope["aws.event"] correctly (AD-19).
+
+  COST ESTIMATES (dev environment):
+    Cognito: first 50,000 monthly active users free.
+    API Gateway HTTP API: first 300 million requests/month free (12 months),
+      then $1/million requests. Negligible for dev.
+    Lambda: first 1 million requests/month free forever. Negligible for dev.
+    RDS db.t3.micro: ~$0.017/hr ≈ $12/month. Most significant dev cost.
+
+  HOW TO DEPLOY:
+    aws cloudformation deploy \
+      --template-file infrastructure/api.yaml \
+      --stack-name csvforge-api-dev \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --parameter-overrides \
+        NetworkStackName=csvforge-network-dev \
+        DataStackName=csvforge-data-dev \
+        QueuesStackName=csvforge-queues-dev \
+        LambdaZipS3Bucket=<your-deployment-bucket> \
+        LambdaZipS3Key=api/csvforge-api.zip \
+      --region ap-south-1
+
+  See AD-06, AD-19, AD-20, AD-23 in docs/DECISIONS.md.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: csvforge-network-dev
+    Description: Name of the network stack to import VPC/subnet/SG outputs from.
+
+  DataStackName:
+    Type: String
+    Default: csvforge-data-dev
+    Description: Name of the data stack to import the S3 bucket name from.
+
+  QueuesStackName:
+    Type: String
+    Default: csvforge-queues-dev
+    Description: Name of the queues stack to import the SQS queue URL/ARN from.
+
+  LambdaZipS3Bucket:
+    Type: String
+    Description: >
+      S3 bucket containing the API Lambda zip file.
+      Create this bucket manually before deploying (it's not managed by this stack
+      to avoid a chicken-and-egg problem). Example: csvforge-deploy-artifacts.
+
+  LambdaZipS3Key:
+    Type: String
+    Default: api/csvforge-api.zip
+    Description: S3 key of the API Lambda zip file within LambdaZipS3Bucket.
+
+  RDSEndpoint:
+    Type: String
+    Description: >
+      RDS instance endpoint hostname (e.g. csvforge.abc123.ap-south-1.rds.amazonaws.com).
+      Obtained from the RDS instance after creation. Set as a Lambda env var.
+
+  DBSecretArn:
+    Type: String
+    Description: >
+      ARN of the Secrets Manager secret containing DB username and password.
+      Lambda uses this to fetch credentials at cold start (AD-16).
+
+  CognitoUserPoolId:
+    Type: String
+    Description: >
+      Cognito User Pool ID (e.g. ap-south-1_XXXXXXXXX).
+      Created by this stack's CognitoUserPool resource — use the Output value
+      after first deploy, or provide a pre-existing pool ID.
+    Default: ""
+
+Resources:
+
+  # ── Cognito User Pool ──────────────────────────────────────────────────────
+  # The User Pool is the identity store — it stores user credentials and
+  # manages the authentication flow. Think of it as a managed "users table"
+  # with built-in authentication APIs.
+  #
+  # WHY COGNITO (not custom auth):
+  #   - Managed service: handles password hashing, MFA, account lockout.
+  #   - OIDC-compatible: issues standard JWTs verifiable by API Gateway.
+  #   - Free tier: first 50,000 monthly active users are free.
+  #   - Industry standard: demonstrates enterprise-grade auth knowledge.
+  #
+  # PasswordPolicy: minimum 8 chars, require uppercase + lowercase + number + symbol.
+  # This matches common enterprise security requirements and prevents trivially
+  # weak passwords.
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: csvforge-users-dev
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      # MfaConfiguration: OFF for dev simplicity. Enable in production.
+      MfaConfiguration: "OFF"
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  # ── Cognito App Client ─────────────────────────────────────────────────────
+  # An App Client represents a specific application (this frontend) that is
+  # allowed to authenticate against the User Pool. Each client has its own
+  # client_id that is included in JWT claims.
+  #
+  # WHY NO CLIENT SECRET:
+  #   A browser (public client) cannot keep a secret — JavaScript is fully
+  #   visible to the user. App clients for browser apps must not have a
+  #   client secret. The authentication code flow with PKCE (Proof Key for
+  #   Code Exchange) is used instead — PKCE provides security without a secret.
+  #
+  # ALLOWED FLOWS:
+  #   ALLOW_USER_PASSWORD_AUTH: allows username+password auth via InitiateAuth API.
+  #     Used by custom login forms (not the Hosted UI).
+  #   ALLOW_REFRESH_TOKEN_AUTH: allows refreshing access tokens using a refresh token.
+  #   Note: ALLOW_USER_SRP_AUTH (Secure Remote Password) is the more secure
+  #   alternative for custom forms. For MVP simplicity, USER_PASSWORD_AUTH is used.
+  #   Production: switch to SRP or use the Hosted UI which handles this automatically.
+  CognitoAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: csvforge-web-dev
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      # AccessTokenValidity: 1 hour (default). Users must re-authenticate hourly
+      # or use a refresh token (AD-10).
+      AccessTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  # ── Cognito Admin Group ────────────────────────────────────────────────────
+  # Cognito groups allow role-based access control without custom claim logic.
+  # The csvforge-admins group grants access to GET /admin/jobs.
+  #
+  # HOW IT WORKS:
+  #   1. An admin adds a user to this group via the Cognito console or CLI.
+  #   2. On login, Cognito includes cognito:groups: ["csvforge-admins"] in the
+  #      access token.
+  #   3. API Gateway JWT Authoriser passes the claim to FastAPI.
+  #   4. get_current_user() reads cognito:groups and sets is_admin=True.
+  #   5. require_admin() permits or denies access.
+  #
+  # Adding a user to the admin group (CLI):
+  #   aws cognito-idp admin-add-user-to-group \
+  #     --user-pool-id <pool_id> \
+  #     --username <email> \
+  #     --group-name csvforge-admins \
+  #     --region ap-south-1
+  CognitoAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: csvforge-admins
+      UserPoolId: !Ref CognitoUserPool
+      Description: CSVForge administrators — can view all jobs via GET /admin/jobs
+
+  # ── Lambda Execution Role ──────────────────────────────────────────────────
+  # IAM role assumed by the API Lambda function. Grants least-privilege access
+  # to the specific AWS resources the API actually uses (AD-20).
+  #
+  # Permissions:
+  #   logs:* on the Lambda log group — CloudWatch logging
+  #   ec2:* for VPC networking — Lambda needs these to run in a VPC
+  #   s3:PutObject on uploads/* — generate presigned URLs (requires the permission)
+  #   s3:GetObject on uploads/* + processed/* — HeadObject check + download URLs
+  #   sqs:SendMessage on the main queue — enqueue job messages
+  #   secretsmanager:GetSecretValue on the DB secret ARN — fetch DB password
+  APILambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: csvforge-api-role-dev
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # AWSLambdaVPCAccessExecutionRole grants ec2:CreateNetworkInterface,
+        # ec2:DescribeNetworkInterfaces, ec2:DeleteNetworkInterface — required
+        # for Lambda to attach to a VPC subnet and security group.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: csvforge-api-policy-dev
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs — allow Lambda to write its logs.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/csvforge-api-dev:*"
+
+              # S3 — presigned URL generation for uploads and downloads.
+              # s3:PutObject is required to generate presigned PUT URLs.
+              # s3:GetObject is required for presigned GET URLs and HeadObject checks.
+              # Scoped to uploads/* and processed/* prefixes (AD-20).
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub
+                    - "${BucketArn}/uploads/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${DataStackName}-BucketArn"
+                  - !Sub
+                    - "${BucketArn}/processed/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${DataStackName}-BucketArn"
+
+              # SQS — publish job messages to the main queue.
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  Fn::ImportValue: !Sub "${QueuesStackName}-MainQueueArn"
+
+              # Secrets Manager — fetch DB password at Lambda cold start (AD-16).
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DBSecretArn
+
+  # ── API Lambda Function ────────────────────────────────────────────────────
+  # The FastAPI application runs inside this Lambda function.
+  # Mangum translates API Gateway events to ASGI requests (AD-06).
+  #
+  # PackageType: Zip — zip artifact (not container image, unlike the worker).
+  # The API has no binary dependencies that require a container. AD-06.
+  #
+  # VpcConfig: Lambda must run in the VPC to reach RDS (private subnet, AD-15).
+  APILambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: csvforge-api-dev
+      Runtime: python3.14
+      Handler: backend.main.handler
+      # handler points to the Mangum handler instance.
+      # In backend/main.py, add at the bottom:
+      #   from mangum import Mangum
+      #   handler = Mangum(app)
+      Role: !GetAtt APILambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaZipS3Bucket
+        S3Key: !Ref LambdaZipS3Key
+      Timeout: 30
+      # API Lambda: 512 MB is generous for a web API. The heavy lifting
+      # (CSV processing) is done by the Worker Lambda. AD-06.
+      MemorySize: 512
+      Environment:
+        Variables:
+          ENVIRONMENT: production
+          DB_SECRET_ARN: !Ref DBSecretArn
+          DB_HOST: !Ref RDSEndpoint
+          DB_PORT: "5432"
+          DB_NAME: csvforge
+          AWS_DEFAULT_REGION: !Ref AWS::Region
+          S3_BUCKET_NAME:
+            Fn::ImportValue: !Sub "${DataStackName}-BucketName"
+          SQS_QUEUE_URL:
+            Fn::ImportValue: !Sub "${QueuesStackName}-MainQueueUrl"
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetAId"
+          - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetBId"
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${NetworkStackName}-LambdaSecurityGroupId"
+
+  # ── CloudWatch Log Group for API Lambda ───────────────────────────────────
+  # Create the log group explicitly so we control the retention period.
+  # Without this, Lambda creates a log group with infinite retention —
+  # logs accumulate forever and you pay for storage.
+  APILambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${APILambda}"
+      RetentionInDays: 14
+
+  # ── API Gateway HTTP API ───────────────────────────────────────────────────
+  # HTTP API (not REST API) — lower latency, lower cost, native JWT support.
+  # Routes all requests to the API Lambda via a catch-all route: $default.
+  # Mangum inside Lambda handles path-based routing.
+  #
+  # CorsConfiguration: allow the frontend origin to call the API with the
+  # Authorization header. The AllowedOrigins list must match the frontend URL.
+  APIGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: csvforge-api-dev
+      ProtocolType: HTTP
+      Description: CSVForge REST API — HTTP API with JWT authoriser
+      CorsConfiguration:
+        AllowOrigins:
+          - "http://localhost:5173"
+          # Production: replace with your CloudFront or S3 static website URL.
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Authorization
+          - Content-Type
+          - X-Dev-User-Id
+          - X-Dev-User-Email
+          - X-Dev-Is-Admin
+        ExposeHeaders:
+          - Content-Range
+        AllowCredentials: true
+        MaxAge: 3000
+
+  # ── JWT Authoriser ────────────────────────────────────────────────────────
+  # The JWT Authoriser validates the Bearer token in every request:
+  #   - Downloads JWKS from IdentitySource (Cognito's public keys endpoint).
+  #   - Verifies the token signature.
+  #   - Verifies iss matches the User Pool issuer URL.
+  #   - Verifies the token is not expired.
+  #   - Verifies aud/client_id matches the App Client ID.
+  # FastAPI never sees invalid tokens — API Gateway rejects them with 401.
+  #
+  # IdentitySource: $request.header.Authorization
+  #   The JWT is expected in the Authorization header as: Bearer <token>
+  APIAuthoriser:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref APIGateway
+      AuthorizerType: JWT
+      Name: csvforge-cognito-authoriser
+      IdentitySource:
+        - "$request.header.Authorization"
+      JwtConfiguration:
+        # Issuer: Cognito's OIDC issuer URL for this User Pool.
+        # Lambda reads the pool ID from the UserPool resource reference.
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}"
+        # Audience: the App Client ID. Tokens not intended for this client are rejected.
+        Audience:
+          - !Ref CognitoAppClient
+
+  # ── Lambda Integration ────────────────────────────────────────────────────
+  # Connects API Gateway to the Lambda function.
+  # PayloadFormatVersion: "2.0" — sends the HTTP API payload format 2.0 event
+  # to Lambda. Mangum 0.22.0 expects this format (AD-19).
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref APIGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt APILambda.Arn
+      PayloadFormatVersion: "2.0"
+
+  # ── Default Route ─────────────────────────────────────────────────────────
+  # $default catches ALL requests regardless of path or method.
+  # Mangum/FastAPI handles routing internally.
+  # AuthorizerId is set so the JWT Authoriser applies to ALL routes.
+  # To make specific routes public (like /health), configure separate routes
+  # without AuthorizerId.
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "$default"
+      Target: !Sub "integrations/${LambdaIntegration}"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref APIAuthoriser
+
+  # ── Health Check Route (no auth) ───────────────────────────────────────────
+  # The /health endpoint must be reachable without a JWT (load balancer probes,
+  # uptime monitoring tools). Override the default JWT requirement for this path.
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "GET /health"
+      Target: !Sub "integrations/${LambdaIntegration}"
+      AuthorizationType: NONE
+
+  # ── API Stage (auto-deploy) ───────────────────────────────────────────────
+  # HTTP API stages group routes into a deployment. $default is the built-in
+  # stage for HTTP APIs — it does not add a path prefix (unlike REST APIs
+  # which prefix paths with /stageName/).
+  APIStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref APIGateway
+      StageName: "$default"
+      AutoDeploy: true
+
+  # ── Lambda Permission ─────────────────────────────────────────────────────
+  # Explicitly grants API Gateway permission to invoke the Lambda function.
+  # Without this, API Gateway receives a 403 when it tries to call Lambda —
+  # even if the Lambda role is correct. This permission operates at the
+  # resource level (Lambda resource-based policy), not the IAM role.
+  APIGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref APILambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*"
+
+Outputs:
+  APIEndpoint:
+    Description: >
+      API Gateway HTTP API endpoint URL.
+      Format: https://<api-id>.execute-api.<region>.amazonaws.com
+      Use this as the base URL for frontend API calls.
+    Value: !GetAtt APIGateway.ApiEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-APIEndpoint"
+
+  CognitoUserPoolId:
+    Description: >
+      Cognito User Pool ID.
+      Used by the frontend (amazon-cognito-identity-js) to authenticate users.
+      Also needed for the JWT Authoriser issuer URL.
+      Format: ap-south-1_XXXXXXXXX
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-CognitoUserPoolId"
+
+  CognitoAppClientId:
+    Description: >
+      Cognito App Client ID (no secret).
+      Used by the frontend to initiate authentication flows.
+      Set as VITE_COGNITO_CLIENT_ID in the frontend .env.
+    Value: !Ref CognitoAppClient
+    Export:
+      Name: !Sub "${AWS::StackName}-CognitoAppClientId"
+
+  APILambdaArn:
+    Description: ARN of the API Lambda function.
+    Value: !GetAtt APILambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-APILambdaArn"

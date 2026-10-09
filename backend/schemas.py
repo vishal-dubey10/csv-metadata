@@ -89,6 +89,8 @@ Interview concept:
     to trace the original problem.
 """
 
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -196,3 +198,180 @@ class UploadCompleteResponse(BaseModel):
 
     job_id: str
     status: str
+
+
+# ── Job lifecycle schemas ─────────────────────────────────────────────────────
+# These schemas are used by the job status, listing, and download endpoints.
+# They deliberately expose only the subset of Job ORM fields that are safe
+# and useful for clients — not every database column.
+#
+# AD-23: user_id is the Cognito sub claim (authoritative, tamper-proof).
+# AD-13: pending_upload jobs are excluded from list/get responses.
+
+
+class JobResponse(BaseModel):
+    """
+    Response body for GET /jobs/{job_id}.
+
+    WHAT:
+        The public view of a single Job record. Contains all fields the
+        frontend needs to display job status, processing results, and
+        any failure information.
+
+    SECURITY:
+        Does NOT expose internal fields that could aid enumeration:
+        - original_s3_key: internal S3 path; not needed by the browser
+        - processed_s3_key: internal S3 path; browser uses the download
+          endpoint to get a presigned URL (not the raw key)
+        - user_id: not needed by the owner (they already know who they are)
+
+    WHY OPTIONAL FIELDS:
+        Processing results (row_count, column_count, etc.) are NULL in
+        PostgreSQL until the worker completes the job. Pydantic Optional[X]
+        maps to a nullable JSON value — the frontend receives null for
+        these fields until the job is completed.
+
+    IMPORTANT: column_names uses Optional[list[str]] because SQLite returns
+        None for unset ARRAY columns. The type annotation matches both
+        PostgreSQL ARRAY(TEXT) and SQLite TEXT representations.
+    """
+
+    job_id: str
+    status: str
+    original_filename: str
+    user_email: str
+    file_size_bytes: Optional[int] = None
+    row_count: Optional[int] = None
+    column_count: Optional[int] = None
+    column_names: Optional[list[str]] = None
+    duplicate_rows_removed: Optional[int] = None
+    failure_reason: Optional[str] = None
+    created_at: Optional[str] = None   # ISO-8601 string (serialised from TIMESTAMPTZ)
+    updated_at: Optional[str] = None   # ISO-8601 string
+
+    model_config = {"from_attributes": True}
+    """
+    from_attributes=True enables Pydantic to populate this model from a
+    SQLAlchemy ORM object (Job) by reading attributes, not just dict keys.
+
+    Without this, `JobResponse.model_validate(job_orm_object)` would fail
+    because Pydantic would try to call job["job_id"] (dict access) instead
+    of job.job_id (attribute access). Setting from_attributes=True enables
+    the ORM-to-schema bridge.
+
+    This is equivalent to Pydantic v1's `class Config: orm_mode = True`.
+    """
+
+
+class JobListResponse(BaseModel):
+    """
+    Response body for GET /jobs.
+
+    WHAT:
+        A list of Job summaries for the authenticated user. Wraps the list
+        in an envelope so we can add pagination metadata later without
+        breaking the API contract.
+
+    WHY A WRAPPER OBJECT (not a bare list):
+        A bare JSON array [] is valid but inconvenient for pagination.
+        Wrapping in {"jobs": [...], "total": N} lets us add page/limit
+        metadata later without changing the structure of the array items.
+        It also avoids JSON array injection vulnerabilities in old browsers
+        (a now-mitigated CSRF attack vector).
+    """
+
+    jobs: list[JobResponse]
+    total: int
+
+
+class JobDownloadResponse(BaseModel):
+    """
+    Response body for GET /jobs/{job_id}/download.
+
+    WHAT:
+        Returns a presigned S3 GET URL the browser can use to download
+        the processed CSV file directly from S3.
+
+    WHY A PRESIGNED URL (not a proxy download):
+        The processed file lives in S3. The browser could download via
+        FastAPI, but that would require Lambda to stream the entire file
+        through memory — wasteful for files up to 50 MiB and unnecessary
+        given S3's direct HTTP delivery. The presigned URL lets the browser
+        pull the file directly from S3 with no Lambda involvement.
+
+    FIELDS:
+        job_id: the job this download URL belongs to (for client correlation).
+        download_url: a presigned S3 GET URL, valid for 15 minutes (900s).
+        filename: the suggested download filename for the Content-Disposition
+                  header. The browser will offer this name in the "Save As"
+                  dialog. We derive it from the original_filename with a
+                  "_processed" suffix.
+        expires_in_seconds: how long the URL is valid. The browser should
+                  initiate the download before this expires.
+    """
+
+    job_id: str
+    download_url: str
+    filename: str
+    expires_in_seconds: int = 900
+
+
+class PostJobRequest(BaseModel):
+    """
+    Request body for POST /jobs (alias for POST /uploads/intent).
+
+    WHAT:
+        An alternative name for the upload intent endpoint, using the
+        /jobs resource path instead of /uploads/intent.
+
+    WHY TWO ROUTES:
+        POST /uploads/intent was the original route name from Day 1/2.
+        POST /jobs follows REST conventions more closely (creating a Job
+        resource). Both routes call the same underlying logic.
+
+        The spec's candidate endpoint list (section 8) lists POST /jobs.
+        Both are kept for backwards compatibility. The /uploads/intent form
+        is referenced in all existing tests and documentation.
+    """
+
+    user_email: str
+    original_filename: str
+    file_size_bytes: int
+
+
+class AdminJobResponse(BaseModel):
+    """
+    Response body for GET /admin/jobs — includes internal fields.
+
+    WHAT:
+        The admin view of a Job record. Adds the internal S3 keys and
+        user_id that the user-facing JobResponse omits.
+
+    WHY DIFFERENT FROM JobResponse:
+        Admins legitimately need internal fields for debugging:
+        - original_s3_key: to investigate what was uploaded
+        - processed_s3_key: to check if the output file is present
+        - user_id: to correlate a job with a Cognito user
+
+        These fields are restricted to the admin endpoint (which checks
+        the 'csvforge-admins' Cognito group membership). They are never
+        returned by user-facing endpoints.
+    """
+
+    job_id: str
+    user_id: str
+    user_email: str
+    status: str
+    original_filename: str
+    original_s3_key: Optional[str] = None
+    processed_s3_key: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    row_count: Optional[int] = None
+    column_count: Optional[int] = None
+    column_names: Optional[list[str]] = None
+    duplicate_rows_removed: Optional[int] = None
+    failure_reason: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    model_config = {"from_attributes": True}

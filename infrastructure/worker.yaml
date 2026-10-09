@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge Worker Layer — Worker Lambda (container image), ECR repository,
+  and SQS event source mapping.
+
+  WHAT THIS TEMPLATE DOES:
+    Creates the infrastructure that processes CSVForge jobs asynchronously:
+      1. ECR repository — stores the worker Docker image
+      2. Lambda execution role — least-privilege IAM permissions
+      3. Lambda function (container image) — the CSV processing worker
+      4. CloudWatch log group — worker logs with 14-day retention
+      5. SQS event source mapping — connects the SQS queue to Lambda
+
+  DEPENDENCY ORDERING (deploy after these stacks):
+    1. csvforge-network-dev  (VPC, subnets, security groups)
+    2. csvforge-data-dev     (S3 bucket)
+    3. csvforge-queues-dev   (SQS queue)
+    (Does NOT depend on api.yaml — see AD-26)
+
+  HOW THE WORKER PROCESSES JOBS:
+
+    FastAPI (api.yaml Lambda)
+      │ POST /uploads/{job_id}/complete
+      │ → sends SQS message: {job_id, s3_key}
+      ▼
+    SQS queue (csvforge-jobs-dev)
+      │ Event Source Mapping polls the queue
+      │ Batch size = 1 (AD-07)
+      ▼
+    Worker Lambda (this template)
+      │ lambda_handler(event, context)
+      │ → claim_job_for_processing() — atomic idempotency guard (AD-08)
+      │ → download_file(S3, original_s3_key, /tmp)
+      │ → parse_and_analyse() — validation (AD-21)
+      │ → clean() — trim + dedup
+      │ → upload_file(S3, processed_s3_key)  ← S3 before DB (AD-14)
+      │ → complete_job() / fail_job()
+      ▼
+    PostgreSQL (RDS, not in this stack — external dependency)
+
+  WHY CONTAINER IMAGE (not zip):
+    The worker has psycopg[binary] — a compiled C extension that links
+    against libpq. Binary wheels are OS/architecture specific. Building
+    inside the official Lambda base image ensures the binary is compiled
+    for the exact Amazon Linux environment Lambda runs. AD-05.
+
+  IMPORTANT COSTS:
+    ECR: $0.10/GB-month for storage.
+      A Python 3.14 Lambda image ≈ 300-500 MB → ~$0.03-0.05/month.
+    Lambda: invocations cost $0.0000166667 per GB-second.
+      1024 MB × 30s (max) = 30.72 GB-seconds ≈ $0.000512 per invocation.
+      At 100 invocations/day → ~$1.54/month.
+    ECR API calls (image push): $0.01 per 1000 GET requests → negligible.
+
+  HOW TO PUSH THE WORKER IMAGE:
+    1. Build: docker build -f worker/Dockerfile -t csvforge-worker .
+    2. Authenticate: aws ecr get-login-password --region ap-south-1 | \
+         docker login --username AWS --password-stdin \
+         <account-id>.dkr.ecr.ap-south-1.amazonaws.com
+    3. Tag: docker tag csvforge-worker \
+         <account-id>.dkr.ecr.ap-south-1.amazonaws.com/csvforge-worker-dev:<ImageTag>
+    4. Push: docker push \
+         <account-id>.dkr.ecr.ap-south-1.amazonaws.com/csvforge-worker-dev:<ImageTag>
+    5. Deploy: aws cloudformation deploy --template-file infrastructure/worker.yaml \
+         --stack-name csvforge-worker-dev --capabilities CAPABILITY_NAMED_IAM \
+         --parameter-overrides ImageTag=<ImageTag> ...
+
+  See AD-05, AD-07, AD-08, AD-14, AD-17, AD-26, AD-28 in docs/DECISIONS.md.
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: csvforge-network-dev
+    Description: Network stack name to import VPC/subnet/SG outputs.
+
+  DataStackName:
+    Type: String
+    Default: csvforge-data-dev
+    Description: Data stack name to import the S3 bucket ARN.
+
+  QueuesStackName:
+    Type: String
+    Default: csvforge-queues-dev
+    Description: Queues stack name to import the SQS queue ARN.
+
+  DBSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret for DB credentials (AD-16).
+
+  RDSEndpoint:
+    Type: String
+    Description: RDS instance endpoint hostname for Lambda DATABASE_URL construction.
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      Docker image tag to deploy.
+      Use a deterministic tag (e.g. git commit SHA) for reproducible deployments.
+      The deployment script (deploy_lambda.sh) passes the build ID as the tag.
+
+Resources:
+
+  # ── ECR Repository ────────────────────────────────────────────────────────
+  # Elastic Container Registry stores the worker Docker image.
+  # Lambda references the image URI from ECR when starting containers.
+  #
+  # WHY ECR (not Docker Hub):
+  #   Lambda container images MUST come from ECR. Docker Hub images cannot
+  #   be used directly — they must be pushed to ECR first.
+  #   ECR in the same account/region as Lambda means:
+  #   - Image pulls stay within the AWS network (no egress charges).
+  #   - IAM controls access (no public Docker Hub registry needed).
+  #
+  # ImageScanningConfiguration:
+  #   ECR can scan images for known CVEs (Common Vulnerabilities and Exposures)
+  #   on push. ScanOnPush: true surfaces vulnerabilities before they reach Lambda.
+  #   Scanning is free for the first scan; subsequent scans use ECR Enhanced Scanning.
+  #
+  # LifecyclePolicy:
+  #   Automatically delete untagged images older than 7 days.
+  #   Every `docker push` creates an untagged image if the tag was moved.
+  #   Without cleanup, these orphaned layers accumulate and incur storage cost.
+  WorkerECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: csvforge-worker-dev
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Delete untagged images older than 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the 5 most recent tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v", "sha"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ── Worker Lambda Execution Role ──────────────────────────────────────────
+  # Least-privilege IAM role. Permissions scoped to exact resources the
+  # worker actually uses (AD-20):
+  #   - S3: GetObject on uploads/* (download input)
+  #         PutObject on processed/* (upload output)
+  #         NOT allowed to read or write in the other direction
+  #   - Secrets Manager: GetSecretValue on this specific secret ARN
+  #   - CloudWatch Logs: write to this Lambda's log group
+  #   - VPC networking: managed policy (create/delete ENIs)
+  WorkerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: csvforge-worker-role-dev
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # VPC networking permissions — required to run Lambda inside a VPC.
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        # SQS trigger permissions — required for the event source mapping to work.
+        # Grants: sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+      Policies:
+        - PolicyName: csvforge-worker-policy-dev
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/csvforge-worker-dev:*"
+
+              # S3: read uploaded CSV from uploads/ prefix.
+              # Cannot write to uploads/ — prevents worker from corrupting input.
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub
+                    - "${BucketArn}/uploads/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${DataStackName}-BucketArn"
+
+              # S3: write processed CSV to processed/ prefix.
+              # Cannot read from processed/ — not needed by the worker.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - "${BucketArn}/processed/*"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${DataStackName}-BucketArn"
+
+              # Secrets Manager: fetch DB credentials at cold start (AD-16).
+              # Scoped to the exact secret ARN — not all secrets in the account.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DBSecretArn
+
+  # ── Worker Lambda Function ────────────────────────────────────────────────
+  # Container-based Lambda function (PackageType: Image, AD-05).
+  #
+  # MemorySize: 1024 MB (AD-01).
+  #   A 50 MB CSV fully loaded into memory as Python dicts can use up to
+  #   200-400 MB depending on the column count and string sizes (Python dict
+  #   overhead: ~200-300 bytes per row for small CSVs). 1024 MB gives ample
+  #   headroom for processing the largest allowed file plus Lambda overhead.
+  #   512 MB (original) was too low — increased to 1024 MB during audit.
+  #
+  # Timeout: 300s (5 minutes, AD-17).
+  #   Processing a 50 MB CSV with deduplication and S3 I/O typically takes
+  #   5-30 seconds. 300s is a conservative ceiling that handles large files
+  #   and slow network conditions.
+  #
+  # SQS VisibilityTimeout (in queues.yaml): 1800s = 6 × Lambda timeout.
+  #   This must be updated in queues.yaml if you change the Lambda timeout.
+  WorkerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: csvforge-worker-dev
+      PackageType: Image
+      # ImageUri: ECR image URI. Format:
+      #   <account-id>.dkr.ecr.<region>.amazonaws.com/<repo-name>:<tag>
+      # CloudFormation cannot know the account ID at template-write time,
+      # so we use !Sub to inject it at deploy time.
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${WorkerECRRepository}:${ImageTag}"
+      Role: !GetAtt WorkerLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      # EphemeralStorage: /tmp storage. Default is 512 MB.
+      # The worker downloads the input CSV to /tmp (up to 50 MB) and writes
+      # the processed output to /tmp (similar size). 512 MB is sufficient
+      # for two 50 MB files with overhead. Increase if multi-file processing
+      # is added in future.
+      EphemeralStorage:
+        Size: 512
+      Environment:
+        Variables:
+          ENVIRONMENT: production
+          DB_SECRET_ARN: !Ref DBSecretArn
+          DB_HOST: !Ref RDSEndpoint
+          DB_PORT: "5432"
+          DB_NAME: csvforge
+          AWS_DEFAULT_REGION: !Ref AWS::Region
+          S3_BUCKET_NAME:
+            Fn::ImportValue: !Sub "${DataStackName}-BucketName"
+          # S3_OUTPUT_BUCKET falls back to S3_BUCKET_NAME if not set (AD-D2-09).
+          # Single bucket for dev — both input and output in the same bucket.
+          LOG_LEVEL: INFO
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetAId"
+          - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetBId"
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${NetworkStackName}-LambdaSecurityGroupId"
+
+  # ── CloudWatch Log Group ──────────────────────────────────────────────────
+  # Explicit log group with 14-day retention.
+  # Lambda creates a log group automatically if one doesn't exist, but with
+  # infinite retention. Creating it here gives us control over cost.
+  WorkerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${WorkerLambda}"
+      RetentionInDays: 14
+
+  # ── SQS Event Source Mapping ──────────────────────────────────────────────
+  # Connects the SQS main queue to the Lambda function.
+  # Lambda polls the queue, receives messages in batches, and calls
+  # lambda_handler(event, context) with a batch of records.
+  #
+  # BatchSize: 1 (AD-07).
+  #   With batch size > 1, a Lambda exception causes ALL messages in the batch
+  #   to be retried — including successfully processed ones. Each job is
+  #   independent and potentially large (50 MB CSV); processing multiple jobs
+  #   per invocation would risk OOM and makes failure analysis harder.
+  #   Batch size 1: each message is processed independently. One failure affects
+  #   exactly one job. AD-07 documents the ReportBatchItemFailures analysis.
+  #
+  # FunctionResponseTypes: NOT set.
+  #   With BatchSize=1, partial batch reporting is meaningless — there is only
+  #   one item. FunctionResponseTypes=ReportBatchItemFailures only helps when
+  #   BatchSize > 1. AD-07.
+  #
+  # MaximumBatchingWindowInSeconds: 0.
+  #   No batching delay. Process each message as soon as it arrives.
+  #   A batching window would delay processing by up to N seconds to accumulate
+  #   a full batch — undesirable when BatchSize=1.
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref WorkerLambda
+      EventSourceArn:
+        Fn::ImportValue: !Sub "${QueuesStackName}-MainQueueArn"
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      Enabled: true
+      # StartingPosition is not applicable for SQS (only for Kinesis/DynamoDB Streams).
+
+Outputs:
+  WorkerLambdaArn:
+    Description: ARN of the Worker Lambda function.
+    Value: !GetAtt WorkerLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerLambdaArn"
+
+  WorkerLambdaName:
+    Description: >
+      Name of the Worker Lambda function.
+      Used for manual invocation and monitoring:
+        aws lambda invoke --function-name <this value> --payload '...' response.json
+    Value: !Ref WorkerLambda
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkerLambdaName"
+
+  ECRRepositoryUri:
+    Description: >
+      ECR repository URI for the worker image.
+      Use when pushing new images:
+        docker tag csvforge-worker <this value>:<tag>
+        docker push <this value>:<tag>
+      Format: <account>.dkr.ecr.<region>.amazonaws.com/<repo>
+    Value: !GetAtt WorkerECRRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-ECRRepositoryUri"
+
+  EventSourceMappingId:
+    Description: UUID of the SQS event source mapping (for debugging).
+    Value: !Ref SQSEventSourceMapping

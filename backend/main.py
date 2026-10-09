@@ -2,7 +2,7 @@
 CSVForge — FastAPI application entry point.
 
 This module creates the FastAPI app instance, registers middleware,
-and defines the health check endpoint.
+and defines all HTTP endpoints.
 
 WSGI vs ASGI:
     WSGI (Web Server Gateway Interface) is the traditional Python web protocol —
@@ -29,60 +29,118 @@ MANGUM:
 FULL REQUEST LIFECYCLE:
 
     Browser
-       │ HTTP Request
+       │ HTTP Request (with Authorization: Bearer <access_token>)
     Uvicorn (local) / API Gateway + Mangum (Lambda)
        │ ASGI
     FastAPI
        │
     CORS Middleware  ← checks Origin header, adds CORS response headers
        │
-    Route Matching  ← @app.get("/health") etc.
+    Route Matching  ← @app.get("/jobs") etc.
        │
-    Dependency Resolution  ← Depends(get_db) creates a Session
+    Dependency Resolution:
+       │   Depends(get_current_user) → extracts user identity from JWT or header
+       │   Depends(get_db)           → creates a SQLAlchemy Session
        │
-    Route Handler  ← your function runs here, receives db: Session
+    Route Handler  ← your function runs here
        │
-    Repository Functions  ← job_repository.py
+    Repository Functions  ← job_repository.py (ownership-checked queries)
        │
     SQLAlchemy ORM
        │
     PostgreSQL
        │ response
-    Route Handler returns Python dict
+    Route Handler returns Pydantic model
        │
-    FastAPI serializes to JSON (Pydantic)
+    FastAPI serializes to JSON
        │
     CORS Middleware adds headers
        │
     Uvicorn / Mangum
        │ HTTP Response
     Browser
+
+ENDPOINT OVERVIEW:
+
+    Public:
+        GET  /health                         — liveness probe
+
+    User-facing (authenticated):
+        POST /jobs                           — create job + presigned upload URL (alias for /uploads/intent)
+        POST /uploads/intent                 — same as POST /jobs (original route name)
+        POST /uploads/{job_id}/complete      — confirm S3 upload, transition to queued
+        GET  /jobs                           — list all jobs for the authenticated user
+        GET  /jobs/{job_id}                  — get one job (ownership-checked)
+        GET  /jobs/{job_id}/download         — presigned S3 download URL (ownership-checked)
+
+    Admin-only (requires csvforge-admins group):
+        GET  /admin/jobs                     — list all jobs for all users (paginated)
+
+AUTHENTICATION:
+    All user-facing endpoints require authentication via get_current_user().
+    See backend/auth.py for the full explanation of the local-dev bypass vs
+    the production API Gateway JWT claims path.
+
+AUTHORIZATION (ownership enforcement):
+    Routes that access a specific job ALWAYS verify the caller owns it.
+    This prevents IDOR (Insecure Direct Object Reference) vulnerabilities.
+    See AD-23: user_id from sub claim is the only authoritative identity.
+    See AD-13: missing or wrong-user lookups return 404, not 403.
+
+INTERVIEW CONCEPT — 404 vs 403 for ownership failures (AD-13):
+    When a user requests a job that doesn't exist OR belongs to another user,
+    we return 404 (not 403). This is a security choice: returning 403 would
+    reveal that the job EXISTS (just not accessible), enabling enumeration
+    attacks. With 404 for both cases, an attacker learns nothing from a
+    failed request. The trade-off: genuine "job not found" errors and
+    "wrong owner" errors look identical to the caller — acceptable because
+    legitimate callers always know their own job IDs.
 """
 
 import os
+from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+from backend.auth import CurrentUser, get_current_user, require_admin
 from backend.db.connection import get_db
-from backend.db.job_repository import create_job, get_job_by_id, transition_to_queued
-from backend.s3_client import generate_presigned_upload_url, get_object_size, object_exists
-from backend.schemas import UploadCompleteResponse, UploadIntentRequest, UploadIntentResponse
+from backend.db.job_repository import (
+    count_all_jobs,
+    create_job,
+    get_job_by_id,
+    get_job_by_id_and_user,
+    list_all_jobs,
+    list_jobs_for_user,
+    transition_to_queued,
+)
+from backend.s3_client import (
+    generate_presigned_download_url,
+    generate_presigned_upload_url,
+    get_object_size,
+    object_exists,
+)
+from backend.schemas import (
+    AdminJobResponse,
+    JobDownloadResponse,
+    JobListResponse,
+    JobResponse,
+    PostJobRequest,
+    UploadCompleteResponse,
+    UploadIntentRequest,
+    UploadIntentResponse,
+)
 from backend.sqs_client import send_job_message
 
 # ── App instance ──────────────────────────────────────────────────────────────
-# FastAPI(title=..., version=..., description=...) populates the OpenAPI spec
-# that FastAPI auto-generates at startup. Navigate to http://localhost:8000/docs
-# to see the Swagger UI generated from these fields.
-#
-# Every @app.get() decorator and Python type annotation further populates this
-# spec — FastAPI reads each function's docstring, parameter types, and return
-# type to generate documentation automatically. No separate doc-writing step needed.
 app = FastAPI(
     title="CSVForge API",
-    version="0.1.0",
-    description="CSV upload, processing, and download service.",
+    version="0.2.0",
+    description=(
+        "CSV upload, processing, and download service. "
+        "Day 3/4: full job lifecycle endpoints with authentication and ownership enforcement."
+    ),
 )
 
 # ── CORS middleware ───────────────────────────────────────────────────────────
@@ -91,63 +149,102 @@ app = FastAPI(
 # Access-Control-Allow-Origin headers.
 #
 # The React frontend (Vite dev server) runs at http://localhost:5173.
-# Without this middleware, every API call from the frontend would be
-# blocked by the browser with a CORS error — even though the server
-# returned a 200. The error is enforced by the browser, not the server.
+# Without this middleware, every API call from the frontend would be blocked.
 #
 # allow_credentials=True:
-#   By default CORS blocks credentials (cookies and Authorization headers)
-#   from cross-origin requests. Setting this to True enables the browser
-#   to send cookies and Authorization headers to this API from a different
-#   origin. Required when the React frontend is served from
-#   http://localhost:5173 and needs to call http://localhost:8000 with
-#   an auth token in the Authorization header.
+#   Required when the frontend sends an Authorization header (Cognito JWT)
+#   from a different origin. Browsers refuse to send credentials cross-origin
+#   unless the server explicitly permits it.
 #
 # expose_headers=["Content-Range"]:
-#   By default, the browser's CORS filter only exposes a small set of
-#   "safe" response headers to JavaScript (Content-Type, Cache-Control, etc.).
-#   Content-Range is NOT in that default safe list.
-#
-#   React Admin (the frontend framework) reads the Content-Range header to
-#   know the total count of items for pagination. The API responds with:
-#       Content-Range: jobs 0-9/42
-#   React Admin reads the `/42` part to render page controls ("42 total results").
-#   Without expose_headers, the browser's CORS filter hides this header from
-#   React Admin's JavaScript, and pagination breaks silently.
+#   React Admin reads the Content-Range header for pagination
+#   (format: "jobs 0-24/150"). Without this, the browser hides the header
+#   from JavaScript and pagination breaks silently.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite dev server origin
-    allow_credentials=True,   # allow Authorization header + cookies cross-origin
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Range"],  # needed for React Admin list pagination
+    expose_headers=["Content-Range"],
 )
 
+
+# ── Helper: serialise a Job ORM object to a JobResponse dict ──────────────────
+def _job_to_response(job) -> JobResponse:
+    """
+    Convert a SQLAlchemy Job ORM object to a JobResponse Pydantic model.
+
+    WHAT:
+        Maps ORM attribute names to API response field names. The field
+        mapping is intentional: the ORM uses 'id' while the API exposes
+        'job_id' (clearer for clients; avoids confusion with other 'id' fields).
+        Timestamps are converted from Python datetime objects to ISO-8601 strings.
+
+    WHY A HELPER (not model_validate directly):
+        The ORM's primary key is `job.id`; the schema field is `job_id`.
+        `model_validate` with `from_attributes=True` would try to read
+        `job.job_id`, which doesn't exist. This helper bridges the naming gap.
+
+        Timestamps: SQLAlchemy returns Python datetime objects for TIMESTAMP
+        columns. Pydantic v2 serialises datetime to ISO-8601 automatically,
+        but the schema uses Optional[str] to stay SQLite-compatible (SQLite
+        returns string timestamps in unit tests). The `.isoformat()` call
+        ensures consistent ISO-8601 output regardless of the DB backend.
+    """
+    return JobResponse(
+        job_id=job.id,
+        status=job.status,
+        original_filename=job.original_filename,
+        user_email=job.user_email,
+        file_size_bytes=job.file_size_bytes,
+        row_count=job.row_count,
+        column_count=job.column_count,
+        column_names=job.column_names if job.column_names else None,
+        duplicate_rows_removed=job.duplicate_rows_removed,
+        failure_reason=job.failure_reason,
+        created_at=job.created_at.isoformat() if job.created_at else None,
+        updated_at=job.updated_at.isoformat() if job.updated_at else None,
+    )
+
+
+def _job_to_admin_response(job) -> AdminJobResponse:
+    """
+    Convert a Job ORM object to an AdminJobResponse — includes internal fields.
+
+    The admin response adds original_s3_key, processed_s3_key, and user_id
+    that are omitted from the user-facing JobResponse. These are needed for
+    admin debugging but must never appear in user-facing responses.
+    """
+    return AdminJobResponse(
+        job_id=job.id,
+        user_id=job.user_id,
+        user_email=job.user_email,
+        status=job.status,
+        original_filename=job.original_filename,
+        original_s3_key=job.original_s3_key,
+        processed_s3_key=job.processed_s3_key,
+        file_size_bytes=job.file_size_bytes,
+        row_count=job.row_count,
+        column_count=job.column_count,
+        column_names=job.column_names if job.column_names else None,
+        duplicate_rows_removed=job.duplicate_rows_removed,
+        failure_reason=job.failure_reason,
+        created_at=job.created_at.isoformat() if job.created_at else None,
+        updated_at=job.updated_at.isoformat() if job.updated_at else None,
+    )
+
+
 # ── Health endpoint ───────────────────────────────────────────────────────────
-# HOW FASTAPI REGISTERS ROUTES:
-# @app.get("/health") registers a route: "when the app receives a GET request
-# to /health, call this function". FastAPI reads the function's signature,
-# docstring, and return type at startup to build the OpenAPI spec.
-#
-# The return type annotation (-> dict) tells FastAPI and Pydantic how to
-# serialize the response — Pydantic converts Python objects to JSON-serializable
-# dicts. If the function raises an HTTPException, FastAPI catches it and returns
-# the appropriate HTTP error response automatically.
 @app.get("/health")
 def health_check() -> dict:
     """
     Health check endpoint.
 
     Returns the service status and current runtime environment.
-    Used by:
-    - Docker Compose healthchecks (future)
-    - Load balancer health probes
-    - Quick manual verification that the API is running
+    Used by load balancer health probes and manual smoke tests.
 
-    The `environment` field lets you confirm you're hitting the right
-    deployment (local vs production) without checking env vars directly.
-
-    Returns 200 always — if this endpoint itself fails, the process is broken.
+    Always returns 200 — if this endpoint fails, the process itself is broken.
     """
     return {
         "status": "ok",
@@ -155,56 +252,43 @@ def health_check() -> dict:
     }
 
 
-# ── Upload intent endpoint ─────────────────────────────────────────────────────
-# POST /uploads/intent — step 1 of the two-step upload flow.
-#
-# WHAT THIS ENDPOINT DOES (in order):
-#   1. Reads the caller's identity from headers (local dev bypass per AD-19).
-#   2. Validates the request body via Pydantic (UploadIntentRequest).
-#   3. Creates a Job record in pending_upload status in PostgreSQL.
-#   4. Generates a presigned S3 PUT URL for the browser to upload directly.
-#   5. Returns {job_id, upload_url, s3_key} so the browser can upload to S3.
-#
-# WHAT THIS ENDPOINT DOES NOT DO:
-#   - It does NOT receive the CSV file bytes.
-#   - It does NOT process the CSV.
-#   - It does NOT transition the job beyond pending_upload.
-#
-# WHY TWO STEPS (intent + complete)?
-#   The browser uploads directly to S3 using the presigned URL. FastAPI is
-#   not involved in the upload itself. S3 does not automatically notify the
-#   API when the upload completes — the browser must call /complete to signal
-#   that the upload is done. This two-step flow avoids routing file bytes
-#   through the API server (API Gateway 10 MB limit, Lambda memory, AD-02).
-#
-# S3 KEY FORMAT — why the job ID is in the key:
-#   uploads/{user_id}/{job_id}/original.csv
-#
-#   Including user_id provides a natural "namespace" — all files for a user
-#   are under the same prefix. This enables per-user access policies in IAM
-#   (s3:PutObject on arn:aws:s3:::bucket/uploads/{user_id}/*).
-#
-#   Including job_id makes the key globally unique. Two uploads by the same
-#   user cannot overwrite each other, even if they have the same filename.
-#   The job_id is generated in Python (uuid4) before the DB INSERT, so we
-#   have it available to construct the key in the same request. (See the
-#   UUID generation note in job.py — we need the ID before the INSERT
-#   because we need it to construct the S3 key.)
-#
-#   "original.csv" is a fixed suffix — readable and consistent.
-#
-# LOCAL DEV IDENTITY BYPASS (AD-19):
-#   In production, API Gateway validates the Cognito JWT and injects claims
-#   into the request context. FastAPI reads user_id from the JWT sub claim.
-#   In local development (ENVIRONMENT=local), there is no API Gateway.
-#   Instead, the caller sends X-Dev-User-Id and X-Dev-User-Email headers.
-#   This bypass is strictly gated by ENVIRONMENT=local.
+# ── POST /jobs ─────────────────────────────────────────────────────────────────
+# This is the REST-conventional alias for POST /uploads/intent.
+# Both routes call the same underlying logic.
+# Exposed via the /jobs prefix to follow "resource-first" REST naming.
+@app.post("/jobs", response_model=UploadIntentResponse, status_code=201)
+def create_upload_job(
+    body: PostJobRequest,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> UploadIntentResponse:
+    """
+    Create a new upload job and return a presigned S3 PUT URL.
+
+    WHAT:
+        REST-conventional alias for POST /uploads/intent (see below).
+        Returns HTTP 201 Created (more semantically correct than 200 for
+        resource creation). The response body is identical to /uploads/intent.
+
+    Returns 201 with UploadIntentResponse on success.
+    Returns 422 if the request body fails Pydantic validation.
+    """
+    return _create_upload_job_logic(
+        user_id=current_user.user_id,
+        user_email=body.user_email,
+        original_filename=body.original_filename,
+        db=db,
+    )
+
+
+# ── POST /uploads/intent ──────────────────────────────────────────────────────
+# Original route name from Day 1/2. Kept for backwards compatibility and
+# because all existing tests and the task spec reference this path.
 @app.post("/uploads/intent", response_model=UploadIntentResponse)
 def upload_intent(
     body: UploadIntentRequest,
     db: Session = Depends(get_db),
-    x_dev_user_id: str = Header(default="dev-user-001"),
-    x_dev_user_email: str = Header(default="dev@example.com"),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> UploadIntentResponse:
     """
     Create a new upload job and return a presigned S3 PUT URL.
@@ -215,68 +299,67 @@ def upload_intent(
         the CSV file directly to S3.
 
     HOW (execution order):
-        1. Determine caller identity (local dev header bypass vs JWT claims).
+        1. Extract authenticated user identity (via get_current_user dependency).
         2. Create Job in PostgreSQL (status=pending_upload).
-        3. Build the deterministic S3 key for this upload.
-        4. Generate a presigned PUT URL for that key (expires in 15 min).
+        3. Build the deterministic S3 key: uploads/{user_id}/{job_id}/original.csv
+        4. Generate a presigned PUT URL for that key (expires in 15 min, ≤50 MiB).
         5. Return {job_id, upload_url, s3_key}.
 
     Returns 200 with UploadIntentResponse on success.
+    Returns 401 if not authenticated (production only).
     Returns 422 if the request body fails Pydantic validation.
     """
-    # Identity resolution: in local dev, read from X-Dev-User-Id / X-Dev-User-Email
-    # headers. In production, these values come from the JWT claims injected by
-    # API Gateway (AD-19). The ENVIRONMENT variable gates the bypass.
-    environment = os.getenv("ENVIRONMENT", "production")
-    if environment == "local":
-        # Local bypass: the header values are injected by Header() above.
-        # The caller sets these manually (e.g., curl -H "X-Dev-User-Id: user-1").
-        user_id = x_dev_user_id
-        user_email = x_dev_user_email
-    else:
-        # Production path: JWT claims are injected by API Gateway into the
-        # request scope by Mangum. Not implemented in local dev. AD-19.
-        # This branch is a stub — full JWT extraction is a Day 3 concern.
-        user_id = x_dev_user_id
-        user_email = body.user_email
+    return _create_upload_job_logic(
+        user_id=current_user.user_id,
+        user_email=body.user_email,
+        original_filename=body.original_filename,
+        db=db,
+    )
 
-    # Create the Job record in PostgreSQL.
-    # The job ID is generated in Python (uuid4) by create_job(), so we can
-    # use it to construct the S3 key before the DB INSERT completes.
-    # status defaults to pending_upload — the job is not visible to list_jobs.
+
+def _create_upload_job_logic(
+    user_id: str,
+    user_email: str,
+    original_filename: str,
+    db: Session,
+) -> UploadIntentResponse:
+    """
+    Shared implementation for POST /jobs and POST /uploads/intent.
+
+    WHAT:
+        Both routes create a job and presigned URL using the same logic.
+        Extracting to a private function avoids duplication and keeps
+        both route handlers readable.
+
+    WHY PLACEHOLDER FOR original_s3_key:
+        We need the job.id to construct the S3 key, but create_job() generates
+        the UUID in Python — the UUID is available immediately after create_job()
+        returns, before the DB INSERT is committed. So we pass a placeholder
+        first, then update the field using the returned job.id.
+
+        This works because:
+        1. create_job() generates uuid4() in Python (not DB server_default).
+        2. db.flush() writes the INSERT within the current transaction.
+        3. job.original_s3_key is updated in Python memory.
+        4. get_db() commits at request end, persisting both values together.
+    """
+    # Create the Job record with a placeholder S3 key (updated below).
     job = create_job(
         db=db,
         user_id=user_id,
         user_email=user_email,
-        original_filename=body.original_filename,
-        # original_s3_key is filled in below after we have the job.id.
-        # We pass a placeholder first, then update — but actually we need the
-        # job.id to build the key. Since create_job() generates the UUID in
-        # Python (not the DB), job.id is available immediately after the call.
-        # We use the job.id returned by create_job() to build the final key.
-        # This works because uuid.uuid4() runs in Python BEFORE the DB flush.
+        original_filename=original_filename,
         original_s3_key="__placeholder__",
     )
 
-    # Build the deterministic S3 key using the job_id from the newly created job.
+    # Build the deterministic S3 key using the job_id just generated.
     # Format: uploads/{user_id}/{job_id}/original.csv
-    # This key uniquely identifies this specific upload and cannot collide with
-    # any other job. The user_id prefix enables per-user IAM scoping (AD-20).
+    # Including user_id enables per-user IAM scoping (AD-20).
+    # Including job_id makes the key globally unique across all jobs.
     s3_key = f"uploads/{user_id}/{job.id}/original.csv"
-
-    # Update the job's original_s3_key now that we have the job.id.
-    # We set it directly on the ORM object and rely on the session's flush
-    # (triggered by the get_db dependency at request end) to persist it.
     job.original_s3_key = s3_key
 
-    # Retrieve the S3 bucket name from the environment.
-    # In local dev, this is set in .env (S3_BUCKET_NAME=csvforge-files-dev).
-    # In production Lambda, it's an environment variable set by CloudFormation.
     bucket = os.getenv("S3_BUCKET_NAME", "csvforge-files-dev")
-
-    # Generate the presigned PUT URL. The browser will PUT the CSV bytes to
-    # this URL. The URL is valid for 15 minutes (900 seconds). It includes
-    # a content-length-range condition (≤ 50 MiB) enforced by S3 (AD-27).
     upload_url = generate_presigned_upload_url(bucket=bucket, key=s3_key)
 
     return UploadIntentResponse(
@@ -286,35 +369,12 @@ def upload_intent(
     )
 
 
-# ── Upload complete endpoint ───────────────────────────────────────────────────
-# POST /uploads/{job_id}/complete — step 2 of the two-step upload flow.
-#
-# WHAT THIS ENDPOINT DOES (in order):
-#   1. Verifies the uploaded file exists in S3 (object_exists / get_object_size).
-#   2. Enforces the 50 MiB size limit (AD-27).
-#   3. Transitions the job from pending_upload → queued in PostgreSQL.
-#   4. Publishes a job message to SQS (tells the Lambda worker to process it).
-#   5. Returns {job_id, status: "queued"}.
-#
-# ERROR CODES:
-#   404 — job not found (wrong job_id, or job doesn't belong to this user)
-#   404 — S3 object not found (browser never actually uploaded the file)
-#   422 — file exceeds 50 MiB limit
-#   409 — transition_to_queued returned False (job already queued, wrong state,
-#          or wrong user) — Conflict because the job is not in the expected state
-#   200 — success; job is now queued for processing
-#
-# WHY DB UPDATE BEFORE SQS PUBLISH (AD-29):
-#   The DB update (pending_upload → queued) happens before SQS SendMessage.
-#   This creates a failure window: if SQS send fails after the DB update, the
-#   job is stuck in "queued" with no SQS message. This is a known limitation
-#   (AD-29) — a full transactional outbox would fix it but adds complexity.
-#   The failure is observable via CloudWatch alarms on stuck-queued jobs.
+# ── POST /uploads/{job_id}/complete ───────────────────────────────────────────
 @app.post("/uploads/{job_id}/complete", response_model=UploadCompleteResponse)
 def upload_complete(
     job_id: str,
     db: Session = Depends(get_db),
-    x_dev_user_id: str = Header(default="dev-user-001"),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> UploadCompleteResponse:
     """
     Verify S3 upload and transition job to queued.
@@ -325,80 +385,59 @@ def upload_complete(
         the size limit, queues the job in the DB, and publishes an SQS message.
 
     HOW (execution order):
-        1. Resolve caller identity (local dev header vs JWT).
-        2. Fetch the job from PostgreSQL to get the S3 key.
-        3. Verify the object exists in S3 (proves the browser uploaded it).
-        4. Check object size ≤ 52,428,800 bytes (50 MiB). Return 422 if exceeded.
-        5. transition_to_queued() — conditional UPDATE. Return 409 if False.
-        6. send_job_message() — publish to SQS.
-        7. Return {job_id, status: "queued"}.
+        1. Fetch the job to get its S3 key (uses admin fetch to get the key,
+           ownership is enforced in transition_to_queued WHERE clause).
+        2. Verify the S3 object exists (browser must have uploaded the file).
+        3. Verify file size ≤ 50 MiB via S3 HeadObject (authoritative, AD-27).
+        4. transition_to_queued() — conditional UPDATE enforcing ownership.
+        5. send_job_message() — publish to SQS.
+        6. Return {job_id, status: "queued"}.
 
     Returns 200 with UploadCompleteResponse on success.
     Returns 404 if the job is not found or S3 object is missing.
     Returns 422 if the uploaded file exceeds 50 MiB.
-    Returns 409 if the job cannot be transitioned (wrong state or wrong owner).
+    Returns 409 if the job is not in pending_upload status or wrong owner.
     """
-    # Identity resolution — same local dev bypass as upload_intent.
-    environment = os.getenv("ENVIRONMENT", "production")
-    user_id = x_dev_user_id  # local dev and production stub both use this for now
-
-    # Fetch the job to get its S3 key.
-    # We use get_job_by_id (admin function, no ownership check) because we
-    # enforce ownership separately in transition_to_queued() (which checks user_id).
-    # Using the admin fetch here lets us return 404 for both "not found" and
-    # "wrong user" — avoiding information leakage (AD-13).
+    # Fetch the job to get its S3 key. We use get_job_by_id (admin-style,
+    # no ownership check at this step) because we need the key before we
+    # can verify ownership. Ownership is enforced below in transition_to_queued().
     job = get_job_by_id(db=db, job_id=job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Verify the S3 object actually exists.
-    # The browser told us it uploaded the file, but we cannot trust client claims.
-    # object_exists() issues a HeadObject to S3 — the authoritative source.
-    # If the object is missing (browser lied or upload failed silently), return 404.
     bucket = os.getenv("S3_BUCKET_NAME", "csvforge-files-dev")
     s3_key = job.original_s3_key
 
+    # Verify the S3 object exists (proves the browser uploaded the file).
     if not object_exists(bucket=bucket, key=s3_key):
         raise HTTPException(status_code=404, detail="Uploaded file not found in S3")
 
-    # Verify the uploaded file size does not exceed the 50 MiB limit.
-    # get_object_size() issues a HeadObject and returns ContentLength.
-    # This is the AUTHORITATIVE size — not the client-declared file_size_bytes
-    # from the intent request. Client-supplied metadata is never trusted for
-    # security boundaries (AD-27).
-    #
-    # MAX_UPLOAD_BYTES = 52,428,800 = 50 × 1024 × 1024 bytes = 50 MiB.
-    # The presigned URL already includes a content-length-range condition that
-    # S3 enforces during the PUT. This HeadObject check is a second enforcement
-    # layer — defence in depth. If the presigned URL somehow lacked the condition
-    # (e.g., a bug in URL generation), this check catches it.
-    MAX_UPLOAD_BYTES = 52_428_800
+    # Verify file size ≤ 50 MiB.
+    # ContentLength from HeadObject is the authoritative size (AD-27).
+    # Client-declared file_size_bytes from the intent request is untrusted.
+    MAX_UPLOAD_BYTES = 52_428_800  # 50 MiB
     actual_size = get_object_size(bucket=bucket, key=s3_key)
     if actual_size > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=422,
-            detail=f"File size {actual_size} bytes exceeds maximum allowed 50 MiB ({MAX_UPLOAD_BYTES} bytes)",
+            detail=f"File size {actual_size} bytes exceeds maximum allowed 50 MiB",
         )
 
-    # Attempt the DB state transition: pending_upload → queued.
-    # transition_to_queued() uses a conditional UPDATE with WHERE user_id = <user_id>
-    # AND status = 'pending_upload'. It returns True (1 row updated) or False (0 rows).
-    # False means: job doesn't exist for this user in pending_upload state —
-    # could be wrong user, already queued, or already processing/completed/failed.
-    transitioned = transition_to_queued(db=db, job_id=job_id, user_id=user_id)
+    # Conditional UPDATE: pending_upload → queued, WHERE user_id = current_user.user_id.
+    # Enforces ownership atomically: returns False if the job belongs to a
+    # different user OR is already past pending_upload.
+    transitioned = transition_to_queued(
+        db=db, job_id=job_id, user_id=current_user.user_id
+    )
     if not transitioned:
-        # 409 Conflict: the job is not in the state we expected.
-        # The most common cause is calling /complete twice — the second call
-        # finds the job in "queued" status, not "pending_upload", and returns False.
+        # 409 Conflict: job is not in pending_upload state, or wrong owner.
+        # We don't distinguish the two cases — doing so would leak information.
         raise HTTPException(
             status_code=409,
             detail="Job is not in pending_upload status or does not belong to this user",
         )
 
-    # Publish the SQS message to trigger the Lambda worker.
-    # The message contains only job_id and s3_key (claim-check pattern).
-    # The worker will download the file, process it, and update the DB.
-    # See sqs_client.py for the full explanation of the claim-check pattern.
+    # Publish to SQS (AD-29: DB update before SQS publish — known limitation).
     queue_url = os.getenv(
         "SQS_QUEUE_URL",
         "https://sqs.ap-south-1.amazonaws.com/ACCOUNT_ID_PLACEHOLDER/csvforge-jobs-dev",
@@ -406,3 +445,236 @@ def upload_complete(
     send_job_message(queue_url=queue_url, job_id=job_id, s3_key=s3_key)
 
     return UploadCompleteResponse(job_id=job_id, status="queued")
+
+
+# ── GET /jobs ──────────────────────────────────────────────────────────────────
+@app.get("/jobs", response_model=JobListResponse)
+def list_jobs(
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> JobListResponse:
+    """
+    List all jobs for the authenticated user, ordered newest-first.
+
+    WHAT:
+        Returns all jobs owned by the caller. Excludes pending_upload jobs
+        (AD-13: these are hidden until the upload is confirmed).
+
+    AUTHORIZATION:
+        Ownership is enforced at the query level:
+        `WHERE user_id = current_user.user_id` — never returns other users' jobs.
+        A client cannot bypass this by passing a different user_id — the user_id
+        comes from the validated JWT (via get_current_user), not from the request.
+
+    RESPONSE:
+        {
+          "jobs": [{job_id, status, original_filename, ...}, ...],
+          "total": 5
+        }
+        The `total` count helps the frontend show "You have N jobs."
+
+    Returns 200 with JobListResponse.
+    Returns 401 if not authenticated (production only).
+    """
+    jobs = list_jobs_for_user(db=db, user_id=current_user.user_id)
+    return JobListResponse(
+        jobs=[_job_to_response(j) for j in jobs],
+        total=len(jobs),
+    )
+
+
+# ── GET /jobs/{job_id} ────────────────────────────────────────────────────────
+@app.get("/jobs/{job_id}", response_model=JobResponse)
+def get_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> JobResponse:
+    """
+    Get the current state of a specific job.
+
+    WHAT:
+        Returns the full status and results of one job. The caller must own
+        the job (AD-13: 404 returned for both "not found" and "wrong owner").
+
+    AUTHORIZATION:
+        Uses get_job_by_id_and_user() which filters WHERE id=job_id AND
+        user_id=current_user.user_id. A job that exists but belongs to
+        another user returns 404 (not 403) to prevent enumeration.
+
+    WHY 404 FOR WRONG OWNER:
+        If we returned 403, an attacker who guesses a job UUID would learn
+        "this job exists, it belongs to someone else." With 404, they learn
+        nothing. A UUID is not a security mechanism, but 404-for-wrong-owner
+        is defence in depth.
+
+    STATUS VALUES:
+        queued     → job is in the queue, worker hasn't started yet
+        processing → worker is actively processing the CSV
+        completed  → processing done; row_count, column_names etc. are populated
+        failed     → permanent failure; failure_reason explains why
+
+    Returns 200 with JobResponse.
+    Returns 404 if the job is not found or does not belong to the caller.
+    Returns 401 if not authenticated (production only).
+    """
+    job = get_job_by_id_and_user(
+        db=db, job_id=job_id, user_id=current_user.user_id
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_to_response(job)
+
+
+# ── GET /jobs/{job_id}/download ───────────────────────────────────────────────
+@app.get("/jobs/{job_id}/download", response_model=JobDownloadResponse)
+def download_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+) -> JobDownloadResponse:
+    """
+    Get a presigned S3 download URL for the processed CSV output.
+
+    WHAT:
+        Generates a time-limited presigned GET URL for the processed output
+        file. The browser can use this URL to download the cleaned CSV directly
+        from S3 — no FastAPI proxy needed.
+
+    PRECONDITIONS:
+        The job must exist, belong to the caller, and be in 'completed' status.
+        If the job is still processing, a 409 is returned with guidance.
+
+    WHY A PRESIGNED URL (not streaming via FastAPI):
+        The processed file can be up to 50 MiB. Streaming through FastAPI/Lambda:
+        - Consumes Lambda execution time and memory.
+        - Runs into API Gateway's 10 MiB response payload limit.
+        A presigned URL offloads delivery to S3's HTTP infrastructure — free,
+        scalable, and no Lambda involvement. The URL is valid for 15 minutes (AD-02).
+
+    SECURITY:
+        - Ownership is enforced: the caller must own the job.
+        - The processed_s3_key comes from the database (set by the worker using
+          the DB job record's user_id), not from client input.
+        - The presigned URL is a bearer token: anyone with the URL can download
+          the file for 15 minutes. The frontend should initiate the download
+          immediately after receiving it.
+
+    SUGGESTED FILENAME:
+        The filename field in the response is derived from the original filename
+        with a "_processed" suffix:
+            "my_data.csv" → "my_data_processed.csv"
+        The browser uses this for the Save As dialog.
+
+    Returns 200 with JobDownloadResponse.
+    Returns 404 if the job is not found or does not belong to the caller.
+    Returns 409 if the job is not in 'completed' status.
+    Returns 401 if not authenticated (production only).
+    """
+    from backend.models.job import JobStatus
+
+    job = get_job_by_id_and_user(
+        db=db, job_id=job_id, user_id=current_user.user_id
+    )
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is not completed (current status: {job.status}). "
+                   "Wait for processing to finish before downloading.",
+        )
+
+    if not job.processed_s3_key:
+        # This should be unreachable (completed jobs always have processed_s3_key),
+        # but guard defensively against data inconsistency.
+        raise HTTPException(
+            status_code=500,
+            detail="Job is completed but processed file key is missing. "
+                   "Please contact support.",
+        )
+
+    bucket = os.getenv("S3_BUCKET_NAME", "csvforge-files-dev")
+    download_url = generate_presigned_download_url(
+        bucket=bucket,
+        key=job.processed_s3_key,
+        expiry_seconds=900,
+    )
+
+    # Derive a user-friendly download filename.
+    # "my_data.csv" → "my_data_processed.csv"
+    # "report"      → "report_processed"  (no extension — unlikely but safe)
+    original_name = job.original_filename
+    if "." in original_name:
+        base, ext = original_name.rsplit(".", 1)
+        filename = f"{base}_processed.{ext}"
+    else:
+        filename = f"{original_name}_processed"
+
+    return JobDownloadResponse(
+        job_id=job_id,
+        download_url=download_url,
+        filename=filename,
+        expires_in_seconds=900,
+    )
+
+
+# ── GET /admin/jobs ────────────────────────────────────────────────────────────
+@app.get("/admin/jobs")
+def admin_list_jobs(
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: CurrentUser = Depends(require_admin),
+    _start: int = Query(default=0, alias="_start", ge=0),
+    _end: int = Query(default=25, alias="_end", ge=1),
+    _sort: str = Query(default="created_at", alias="_sort"),
+    _order: str = Query(default="DESC", alias="_order"),
+    status: Optional[str] = Query(default=None),
+) -> list:
+    """
+    List all jobs for all users — admin view.
+
+    WHAT:
+        Returns a paginated list of ALL jobs in the system. Designed for the
+        React Admin frontend which uses the ra-data-simple-rest convention.
+
+    AUTHORIZATION:
+        Requires the caller to be in the 'csvforge-admins' Cognito group
+        (enforced by the require_admin dependency). Returns 403 if not admin.
+
+    PAGINATION (React Admin ra-data-simple-rest convention):
+        Query params: _start (offset), _end (exclusive end).
+        Limit = _end - _start.
+        Response header: Content-Range: jobs {_start}-{_end-1}/{total}
+        React Admin reads Content-Range to render page controls.
+
+        Example: _start=0, _end=10 → rows 0-9, Content-Range: jobs 0-9/42
+
+    STATUS FILTER:
+        Optional `status` query parameter filters to one job state:
+        GET /admin/jobs?status=failed → only failed jobs.
+
+    RETURNS:
+        A JSON array of AdminJobResponse objects (includes internal S3 keys).
+
+    Returns 200 with array of AdminJobResponse.
+    Returns 403 if not in the admin group.
+    Returns 401 if not authenticated.
+    """
+    skip = _start
+    limit = max(1, _end - _start)  # ensure at least 1 row requested
+
+    jobs = list_all_jobs(db=db, skip=skip, limit=limit, status_filter=status)
+    total = count_all_jobs(db=db, status_filter=status)
+
+    # Set Content-Range header for React Admin pagination.
+    # Format: "jobs {first_index}-{last_index}/{total}"
+    # first_index = _start, last_index = _start + len(jobs) - 1
+    last_index = skip + len(jobs) - 1 if jobs else skip
+    response.headers["Content-Range"] = f"jobs {skip}-{last_index}/{total}"
+
+    # Also set Access-Control-Expose-Headers so the browser can read Content-Range
+    # from a cross-origin request. (CORSMiddleware expose_headers handles this
+    # globally; this line is a belt-and-suspenders reminder for documentation.)
+    return [_job_to_admin_response(j) for j in jobs]
