@@ -1,0 +1,51 @@
+{
+  "compilerOptions": {
+    // TypeScript 6.0 — last JS-based compiler (TS 7 is the Go port, not yet stable)
+    // "Bundler" module resolution is recommended for Vite projects — it matches
+    // how bundlers actually resolve modules (no .js extension required, ESM-first).
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    // Emit nothing — Vite handles transpilation. TypeScript is used for
+    // type-checking only (tsc --noEmit in the typecheck script).
+    "noEmit": true,
+
+    // JSX: react-jsx uses the new automatic JSX transform (React 17+).
+    // No `import React from 'react'` needed in every file.
+    "jsx": "react-jsx",
+
+    // Path aliases — keep imports clean without ../../ traversals.
+    // baseUrl + paths are deprecated in TS 6.0 in favour of the new
+    // imports/exports fields in package.json. For a Vite project with
+    // Rolldown, the recommended approach is to leave aliases in vite.config.ts.
+    // We omit baseUrl/paths here and use relative imports throughout the project,
+    // which avoids the deprecation warning and is simpler for a learning project.
+    // "baseUrl": ".",
+    // "paths": { "@/*": ["src/*"] },
+    "ignoreDeprecations": "6.0",
+
+    // Strictness — all strict flags enabled
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false, // relaxed for React event handler patterns
+
+    // Allow importing .js files that are actually .ts (common in ESM projects)
+    "allowImportingTsExtensions": true,
+
+    // Ensure consistent file system casing (important on macOS/Linux differences)
+    "forceConsistentCasingInFileNames": true,
+
+    // Interop — needed for CommonJS modules like amazon-cognito-identity-js
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+
+    // Skip type-checking of .d.ts files in node_modules for faster builds
+    "skipLibCheck": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

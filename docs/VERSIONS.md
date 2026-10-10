@@ -69,11 +69,14 @@ Latest = 2.1.0rc2 | Selected = 2.0.54 | Reason: 2.1 is release candidate, not st
 | **Node.js** | 22.x LTS | **22.12.0** (minimum) | npmjs.com/org/vitejs "Node 20.19+ or 22.12+" | Vite 8 minimum requirement |
 | **React** | 19.3.0 | **19.3.0** | react.dev/blog/2026/09/09/react-19-3 | |
 | **React DOM** | 19.3.0 | **19.3.0** | Same | Must exactly match React |
-| **TypeScript** | 6.0.x (stable Mar 2026) | **6.0.0** | devblogs.microsoft.com/typescript/announcing-typescript-6-0/ "Mar 2026 stable" | Previous docs had "5.x" — stale. TS 6.0 is stable. TS 7.0 is announced but not stable (Go port). Use TS 6.0. |
-| **Vite** | 8.1.x (Apr 2026) | **8.1.0** | vite.dev/blog/announcing-vite8-1 | Previous docs had 7.1.x — stale. Vite 8 uses Rolldown (Rust bundler). Stable from Mar 12, 2026. Node 20.19+ or 22.12+ required. |
-| **React Router** | 8.x | **8.2.0** | reactrouter.com/changelog "8.2.0 current as of Jul 2026" | Install `react-router` (not `react-router-dom` — v8 re-exports from `react-router`) |
-| **MUI** | v9.x | **9.0.0** | github.com/mui/material-ui CHANGELOG.md "v9 stable 2026" | Accessibility improvements; Emotion still the default style engine in v9 unless Pigment CSS opt-in |
-| **React Admin** | 5.x (active 2026) | **5.8.0** | marmelab.com/blog/2026/02/26/react-admin-february-2026-update.html "one minor per month"; confirmed 5.x active | React Admin v5.5+ declared React 19 + MUI v6 compat; v5.8 is a reasonable estimate for Oct 2026. Verify peer deps against MUI v9 at install time. If peer dep conflict: pin MUI to v6.x for React Admin, v9.x for user-facing — document the split. |
+| **TypeScript** | 6.0.x (stable Mar 2026) | **6.0.3** | devblogs.microsoft.com/typescript "6.0.3 latest patch" | Updated from 6.0.0 estimate to actual latest patch |
+| **Vite** | 8.1.x (Apr 2026) | **8.1.0** | vite.dev/blog/announcing-vite8-1 | Vite 8 uses Rolldown (Rust bundler). Stable from Mar 12, 2026. Node 20.19+ or 22.12+ required. |
+| **@vitejs/plugin-react** | 4.3.4 | **6.1.2** | npmjs.com/package/@vitejs/plugin-react | v6.x required for Vite 8 support (v4.x supports only Vite 4–6). |
+| **React Router** | 8.x | **7.1.1** | reactrouter.com "7.1.1 stable" | **Corrected from 8.2.0.** react-router v8 requires react >=19.2.7 and is incompatible with react-admin 5.x (which requires "^6 || ^7"). v7 supports React 19 and is compatible with react-admin. See AD-FE-02. |
+| **MUI** | v9.x | **9.5.0** | github.com/mui/material-ui "v9.5.0" | Latest 9.x. Supported by react-admin 5.15.4 (confirmed via peer dep check). |
+| **React Admin** | 5.x (active 2026) | **5.15.4** | npmjs.com/package/react-admin "5.15.4 latest" | **Updated from 5.8.0 estimate.** 5.15.4 is the actual latest stable. ra-ui-materialui 5.15.4 explicitly supports @mui/material v9. |
+| **ra-data-simple-rest** | (not listed) | **5.15.4** | npmjs.com/package/ra-data-simple-rest | Required separate install (not bundled with react-admin). Matches react-admin minor version exactly. |
+| **typescript-eslint** | (not listed) | **8.71.1** | npmjs.com/package/typescript-eslint "8.71.1" | Required for TypeScript 6.0 support (peer dep: ">=4.8.4 <6.1.0"). Earlier versions do not accept TS 6.x. |
 | **Vitest** | 3.x | **3.1.0** | vitest.dev | Vite-native; pairs with Vite 8 |
 | **@testing-library/react** | 16.x | **16.3.0** | testing-library.com | Supports React 19 |
 | **amazon-cognito-identity-js** | 6.x | **6.3.15** | npmjs.com/package/amazon-cognito-identity-js | Custom login form; version confirmed active |

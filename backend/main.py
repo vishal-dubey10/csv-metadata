@@ -160,9 +160,36 @@ app = FastAPI(
 #   React Admin reads the Content-Range header for pagination
 #   (format: "jobs 0-24/150"). Without this, the browser hides the header
 #   from JavaScript and pagination breaks silently.
+def _get_cors_origins() -> list[str]:
+    """
+    Read allowed CORS origins from the ALLOWED_ORIGINS environment variable.
+
+    WHAT:
+        Returns a list of allowed origins for the CORS middleware. Reads the
+        ALLOWED_ORIGINS env var (comma-separated, e.g.
+        "http://localhost:5173,https://csvforge.example.com"). Falls back to
+        ["http://localhost:5173"] if the variable is not set (local dev default).
+
+    WHY AN ENVIRONMENT VARIABLE (not a hardcoded list):
+        The same Lambda ZIP / Docker image runs in both local dev and production.
+        In production, the frontend URL is different from localhost:5173.
+        Hardcoding localhost:5173 in production would block the deployed frontend.
+        The env var lets operations configure the correct origins at deployment
+        time without rebuilding the application. See AD-FE-05.
+
+    FORMAT:
+        ALLOWED_ORIGINS=http://localhost:5173,https://csvforge-frontend.s3-website.ap-south-1.amazonaws.com
+        Spaces around commas are stripped.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    if raw.strip():
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return ["http://localhost:5173"]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

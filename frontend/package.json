@@ -1,0 +1,48 @@
+{
+  "name": "csvforge-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "lint": "eslint src --report-unused-disable-directives --max-warnings 0",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-router": "7.1.1",
+    "react-router-dom": "7.1.1",
+    "@mui/material": "9.5.0",
+    "@mui/icons-material": "9.5.0",
+    "@mui/system": "9.5.0",
+    "@emotion/react": "11.14.0",
+    "@emotion/styled": "11.14.0",
+    "react-admin": "5.15.4",
+    "ra-data-simple-rest": "5.15.4",
+    "amazon-cognito-identity-js": "6.3.15"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.8",
+    "@types/react-dom": "19.1.6",
+    "@vitejs/plugin-react": "6.1.2",
+    "vite": "8.1.0",
+    "typescript": "6.0.3",
+    "vitest": "3.1.0",
+    "@vitest/coverage-v8": "3.1.0",
+    "@testing-library/react": "16.3.0",
+    "@testing-library/user-event": "14.6.1",
+    "@testing-library/jest-dom": "6.6.3",
+    "jsdom": "26.1.0",
+    "eslint": "9.18.0",
+    "@eslint/js": "9.18.0",
+    "typescript-eslint": "8.71.1",
+    "eslint-plugin-react": "7.37.4",
+    "eslint-plugin-react-hooks": "5.1.0",
+    "eslint-plugin-react-refresh": "0.4.20"
+  }
+}

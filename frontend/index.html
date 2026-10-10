@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Content Security Policy:
+        default-src 'self'         — only load resources from this origin by default
+        script-src 'self'          — no inline scripts (XSS mitigation)
+        style-src 'self' 'unsafe-inline'  — MUI injects inline styles via Emotion; required
+        img-src 'self' data:       — allow data: URIs for MUI icons
+        connect-src 'self' ... (filled in at deploy time based on API Gateway URL)
+      Note: 'unsafe-inline' for style-src is required by Emotion (MUI's CSS-in-JS).
+      This is a known trade-off with Emotion. Future mitigation: Pigment CSS (MUI's
+      build-time CSS alternative, currently experimental).
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http://localhost:8000 https://*.amazonaws.com https://cognito-idp.*.amazonaws.com"
+    />
+    <title>CSVForge — CSV Processing</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

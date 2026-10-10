@@ -604,3 +604,88 @@ A transactional outbox pattern would write the SQS message intent to the databas
 **Rationale:** SQLAlchemy's `ARRAY(TEXT).with_variant(TEXT, "sqlite")` only affects the DDL type mapping (column creation). When a Core `update().values(column_names=[...])` is executed, SQLite's parameter binding receives a Python `list` object, which SQLite does not support natively. In the PostgreSQL path, ARRAY binds correctly. This is an expected limitation of the SQLite unit test environment and is documented in code comments.
 
 **Existing coverage:** `tests/integration/test_job_repository_integration.py` contains PostgreSQL-specific ARRAY tests.
+
+---
+
+## AD-FE-01 — Frontend dependency versions (verified October 2026)
+
+**Context:** VERSIONS.md was audited before implementation and contained estimated versions for some frontend packages. This decision records the verified, installed versions after a live npm registry check.
+
+**Verified decisions:**
+
+| Package | VERSIONS.md estimate | Verified actual (npm registry, Oct 2026) | Decision |
+|---------|---------------------|------------------------------------------|----------|
+| `react-admin` | `5.8.0` | `5.15.4` (latest stable 5.x) | **5.15.4** — use latest stable; 5.8.0 was an estimate |
+| `react-router` | `8.2.0` | v8 exists but incompatible with React Admin (see AD-FE-02) | **7.1.1** — see AD-FE-02 |
+| `@mui/material` | `9.0.0` | `9.5.0` (latest 9.x) | **9.5.0** — MUI 9 supported by react-admin 5.15.4 |
+| `@mui/icons-material` | `9.0.0` | `9.5.0` | **9.5.0** |
+| `amazon-cognito-identity-js` | `6.3.15` | `6.3.15` | **6.3.15** unchanged |
+| `vitest` | `3.1.0` | `3.1.0` | **3.1.0** unchanged |
+| `@testing-library/react` | `16.3.0` | `16.3.0` | **16.3.0** unchanged |
+
+**Actual peer dependency check findings:**
+
+`ra-ui-materialui@5.15.4` (react-admin's MUI sub-package) peer deps:
+```
+@mui/material: ^5.16.12 || ^6.0.0 || ^7.0.0 || ^9.0.0   ← MUI 9 supported
+@mui/utils:    ^5.15.20 || ^6.0.0 || ^7.0.0 || ^9.0.0
+@mui/system:   ^5.15.20 || ^6.0.0 || ^7.0.0 || ^9.0.0
+```
+
+**Conclusion:** react-admin 5.15.4 with MUI 9 is a supported, conflict-free combination. No `--legacy-peer-deps` required. No split MUI installation required.
+
+---
+
+## AD-FE-02 — React Router version: v7 not v8
+
+**Decision:** Use `react-router@7.1.1` for both the user-facing application and React Admin. Do not use `react-router@8`.
+
+**Finding:** `react-router@8` was released in 2026 as a new major version with a breaking change: it requires `react >= 19.2.7` and has an incompatible API with the v6/v7 line. `react-admin@5.15.4` requires `react-router: "^6.28.1 || ^7.1.1"` — v8 is outside this range.
+
+**React Router v7 capabilities:** React Router v7 supports React 19 (peer dep `react >= 18`). It provides `createBrowserRouter`, `RouterProvider`, `useNavigate`, `useParams`, `Outlet`, `Link` — all the APIs used in this project. No missing functionality for CSVForge's routing needs.
+
+**Why not two React Router versions:** Having both v7 (for React Admin) and v8 (for user UI) in the same project would require careful isolation to prevent module resolution conflicts and bundle bloat. The benefit (using v8 APIs) is zero since v7 provides everything needed.
+
+**VERSIONS.md update:** `react-router` row updated to `7.1.1`. The `8.2.0` value was an estimate that assumed v8 was backward-compatible — it is not.
+
+**Trade-off accepted:** v7 API is the production-stable choice for this stack. v8 is available when React Admin adds support in a future release.
+
+---
+
+## AD-FE-03 — Frontend authentication: Cognito in production, X-Dev-User-Id bypass in local dev
+
+**Decision:** The frontend uses `amazon-cognito-identity-js` for Cognito authentication in production. In local development, the `AuthContext` generates a deterministic dev user ID (`dev-user-001`) and includes `X-Dev-User-Id: dev-user-001` and `X-Dev-User-Email: dev@csvforge.local` headers on every API request, relying on the backend's existing local dev bypass (gated by `ENVIRONMENT=local`).
+
+**Configuration:** Three `VITE_` environment variables control both environments:
+- `VITE_API_URL` — backend URL (`http://localhost:8000` for local, API Gateway URL for production)
+- `VITE_COGNITO_USER_POOL_ID` — Cognito User Pool ID (empty string for local dev)
+- `VITE_COGNITO_APP_CLIENT_ID` — Cognito App Client ID (empty string for local dev)
+
+**Local dev detection:** If `VITE_COGNITO_USER_POOL_ID` is empty, the `AuthContext` enters local dev mode: no Cognito calls, no login page, automatic dev user identity. This allows full frontend functionality without deployed Cognito.
+
+**Production enforcement:** In production, `VITE_COGNITO_USER_POOL_ID` is set to the real User Pool ID. The Cognito `InitiateAuth` flow runs. The backend's `ENVIRONMENT=production` prevents the dev bypass from running even if a client sends the dev headers.
+
+**Security:** The dev bypass is protected at two independent layers: (1) frontend doesn't send dev headers when Cognito is configured, (2) backend ignores dev headers when `ENVIRONMENT != local`.
+
+---
+
+## AD-FE-04 — Direct S3 upload via presigned PUT URL; no Authorization header on S3 request
+
+**Decision:** The upload wizard performs the S3 PUT using `XMLHttpRequest` (for progress events) without an `Authorization` header. The presigned URL carries its own AWS signature in the query string — adding a Bearer token header would cause the S3 request to fail.
+
+**Rationale:** A presigned URL is a self-contained capability token. Its signature binds the IAM principal, bucket, key, HTTP method, and expiry. S3 validates the signature from the query string parameters. If the request also includes an `Authorization` header (Cognito Bearer token), S3 sees two authentication mechanisms and rejects the request with `InvalidArgument: Only one auth mechanism allowed`.
+
+**Implementation:** The API client sends `Authorization: Bearer <token>` on all calls to the FastAPI backend. The S3 PUT is made directly to the presigned URL using a separate `XMLHttpRequest` with no custom headers.
+
+**Reference:** AD-02, AD-27.
+
+---
+
+## AD-FE-05 — Backend CORS: ALLOWED_ORIGINS environment variable
+
+**Decision:** `backend/main.py` reads `ALLOWED_ORIGINS` from the environment (comma-separated list). If unset, it defaults to `http://localhost:5173` (Vite dev server). In production, `ALLOWED_ORIGINS` is set to the frontend S3 bucket URL (or CloudFront URL when added).
+
+**Rationale:** Hard-coding `http://localhost:5173` in production CORS config would block the deployed frontend. An environment variable allows the same Docker image / Lambda ZIP to serve both local and production without code changes.
+
+**Format:** `ALLOWED_ORIGINS=https://csvforge-frontend.s3-website.ap-south-1.amazonaws.com,http://localhost:5173`
+

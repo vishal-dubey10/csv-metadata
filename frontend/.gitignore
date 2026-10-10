@@ -1,0 +1,24 @@
+# Build output
+dist/
+dist-ssr/
+
+# Dependencies
+node_modules/
+
+# Environment files (contain real configuration values)
+.env.local
+.env.production
+.env.*.local
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Vite cache
+.vite/
+
+# Test coverage
+coverage/
+
+# Editor
+.DS_Store
+*.swp
