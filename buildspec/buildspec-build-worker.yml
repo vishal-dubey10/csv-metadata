@@ -1,0 +1,160 @@
+# buildspec-build-worker.yml
+#
+# WHAT:
+#   CodeBuild project specification for building and pushing the worker Docker image.
+#   Runs in Stage 3 of the pipeline, in parallel with buildspec-build-api.yml.
+#
+# WHAT THIS BUILD PRODUCES:
+#   A Docker image pushed to ECR with two references:
+#     1. Tag:    {account}.dkr.ecr.ap-south-1.amazonaws.com/csvforge-worker-dev:{git-sha}
+#     2. Digest: sha256:{content-hash}  (immutable — what the deploy stage uses)
+#   A metadata JSON file at s3://csvforge-pipeline-artifacts-dev/worker/latest-meta.json
+#   containing the image URI with digest for the deploy stage.
+#
+# WHY DIGEST OVER TAG FOR DEPLOYMENT:
+#   A tag (e.g., :latest or :a3f9c12) is mutable — anyone can push a new image
+#   with the same tag, silently changing what Lambda runs. A digest is a SHA256
+#   hash of the image manifest + layer content. The same image always has the same
+#   digest; a different image always has a different digest.
+#   Configuring Lambda to use the digest instead of the tag means:
+#   - Lambda always runs the exact image you tested.
+#   - Pushing a new image to ECR does NOT automatically change what Lambda runs.
+#   - Rolling back means pointing Lambda at the old digest.
+#   Both the tag and digest are retained in ECR. The tag is for humans (searching,
+#   viewing history); the digest is for Lambda.
+#
+# DOCKER BUILD CONTEXT = PROJECT ROOT (not ./worker/):
+#   The Dockerfile COPYs both worker/ AND backend/ directories:
+#     COPY worker/handler.py ...
+#     COPY backend/ ...
+#   If the build context were ./worker/, Docker would only know about files
+#   inside worker/ — the COPY backend/ instruction would fail with
+#   "COPY failed: file not found in build context".
+#   Context = project root means Docker has access to all project files.
+#   AD-18 in docs/DECISIONS.md documents this decision.
+#
+# REQUIRED CODEBUILD SETTINGS:
+#   - privileged: true  (allows Docker daemon inside the build container)
+#   - IAM permissions: ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability,
+#     ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:PutImage,
+#     ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload
+#   These are granted by the AmazonEC2ContainerRegistryPowerUser managed policy
+#   on the CodeBuild role (defined in pipeline.yaml).
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-south-1"
+    ECR_REPO_NAME: "csvforge-worker-dev"
+    ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
+
+phases:
+  pre_build:
+    commands:
+      # ── Step 1: Compute identifiers ─────────────────────────────────────────
+      - export GIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+      - export IMAGE_REPO="$ECR_REGISTRY/$ECR_REPO_NAME"
+      - export IMAGE_TAG="$IMAGE_REPO:$GIT_SHA"
+      - echo "Building image: $IMAGE_TAG"
+
+      # ── Step 2: Authenticate Docker to ECR ─────────────────────────────────
+      # ECR uses short-lived tokens (12 hours). get-login-password obtains a token;
+      # `docker login` stores it in ~/.docker/config.json for this build session.
+      # The token is scoped to the ECR registry in this account/region.
+      #
+      # WHY pipe through stdin (not --password flag):
+      #   Using `docker login --password $(aws ecr get-login-password ...)` would
+      #   put the token in the process argument list, visible to `ps aux` and
+      #   stored in shell history. Piping through stdin keeps it out of logs.
+      - echo "Authenticating Docker to ECR..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+      - echo "ECR authentication successful."
+
+  build:
+    commands:
+      # ── Step 3: Build the Docker image ──────────────────────────────────────
+      # -f worker/Dockerfile: the Dockerfile is in the worker/ subdirectory,
+      #   not in the root. The -f flag lets you specify a Dockerfile location
+      #   independent of the build context.
+      # . (dot): the build context is the current directory = project root.
+      #   Docker sends all files in . to the Docker daemon before executing the
+      #   Dockerfile. This is why the Dockerfile can COPY backend/ — because
+      #   backend/ is inside the build context (project root).
+      #   A larger build context = more data sent = slightly slower build start.
+      #   A .dockerignore file would exclude unnecessary files (tests/, .git/, etc.)
+      #   to speed this up — we don't have one yet; adding it is a future improvement.
+      # -t $IMAGE_TAG: tag the image with the git SHA for ECR.
+      - echo "Building Docker image..."
+      - docker build -f worker/Dockerfile -t $IMAGE_TAG .
+      - echo "Docker build complete."
+
+      # ── Step 4: Push the image to ECR ───────────────────────────────────────
+      # docker push uploads all layers to ECR. Layers that already exist in ECR
+      # (from a previous build with the same base image) are skipped — only changed
+      # layers are uploaded. For the worker image, the base image layers (Amazon Linux,
+      # Python runtime) are cached; only the worker code layer is typically re-uploaded.
+      - echo "Pushing image to ECR..."
+      - docker push $IMAGE_TAG
+      - echo "Image pushed."
+
+      # ── Step 5: Retrieve the image digest ────────────────────────────────────
+      # After pushing, ECR assigns a sha256 digest to the image manifest.
+      # We retrieve this digest to use in the Lambda deploy stage.
+      # The digest is immutable — it uniquely identifies this exact image.
+      # `docker inspect --format` reads the RepoDigests field from the local
+      # Docker daemon's image cache (populated during the push).
+      - export IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_TAG)
+      - echo "Image digest: $IMAGE_DIGEST"
+      # Verify the format: should be registry/repo@sha256:...
+      # If it's empty, the push failed silently or docker inspect failed.
+      - |
+        if [ -z "$IMAGE_DIGEST" ]; then
+          echo "ERROR: Could not retrieve image digest. Push may have failed."
+          exit 1
+        fi
+
+      # ── Step 6: Write metadata for the deploy stage ──────────────────────────
+      # The deploy buildspec needs the exact image URI with digest.
+      # We write it to a JSON file and upload to S3 so the deploy stage can read it.
+      # Using digest in the deploy command:
+      #   aws lambda update-function-code \
+      #     --function-name csvforge-worker-dev \
+      #     --image-uri sha256:...
+      # This pins Lambda to exactly this image, not the mutable tag.
+      - |
+        cat > /tmp/worker-image-meta.json << EOF
+        {
+          "git_sha": "$GIT_SHA",
+          "image_tag": "$IMAGE_TAG",
+          "image_digest": "$IMAGE_DIGEST",
+          "ecr_repo": "$IMAGE_REPO",
+          "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        }
+        EOF
+      - cat /tmp/worker-image-meta.json
+      - aws s3 cp /tmp/worker-image-meta.json "s3://$ARTIFACT_BUCKET/worker/latest-meta.json"
+
+      # Also tag as the human-readable "latest" in ECR for easy console browsing.
+      # NOTE: we deploy using the digest, not this tag.
+      # This is purely cosmetic — for humans searching ECR.
+      - docker tag $IMAGE_TAG "$IMAGE_REPO:latest"
+      - docker push "$IMAGE_REPO:latest"
+
+  post_build:
+    commands:
+      - echo "Worker image build complete."
+      - echo "Source revision: $CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - |
+        echo "Deploy command reference (uses digest — not tag):"
+        echo "aws lambda update-function-code \\"
+        echo "  --function-name csvforge-worker-dev \\"
+        echo "  --image-uri $(cat /tmp/worker-image-meta.json | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"image_digest\"])')"
+
+artifacts:
+  files:
+    - /tmp/worker-image-meta.json
+  name: WorkerImageMeta
+  discard-paths: yes

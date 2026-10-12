@@ -1,0 +1,159 @@
+# buildspec-test-backend.yml
+#
+# WHAT:
+#   CodeBuild project specification for backend testing and CloudFormation validation.
+#   Runs on every commit to the main branch as Stage 2 of the pipeline.
+#
+# WHAT THIS BUILD DOES:
+#   1. Installs Python 3.14 runtime.
+#   2. Installs backend production + dev dependencies.
+#   3. Runs all 197 unit tests via pytest (SQLite in-memory, no Docker needed).
+#   4. Validates all 5 CloudFormation templates with cfn-lint (static analysis).
+#   5. Validates templates with aws cloudformation validate-template (AWS syntax check).
+#   Fails the build (and stops the pipeline) if any step exits non-zero.
+#
+# WHY UNIT TESTS ONLY (not integration tests):
+#   Integration tests require a running PostgreSQL instance. CodeBuild managed
+#   environments don't include PostgreSQL. Running Docker-in-Docker is possible
+#   but slow and complex. Unit tests use SQLite in-memory — they run in seconds
+#   with no external dependencies. Integration tests are run separately in a
+#   dedicated CodeBuild project with a VPC configuration that can reach RDS.
+#   This keeps the fast feedback loop (unit tests) separate from the slow
+#   feedback loop (integration tests against real infrastructure).
+#
+# WHY CLOUDFORMATION VALIDATION HERE (not a separate stage):
+#   Template validation is fast (< 30 seconds) and catches errors before any
+#   infrastructure changes are attempted. Running it alongside backend tests
+#   means a bad template is caught in the same pass as bad Python code.
+#   We validate ALL 5 templates on every commit, even if only app code changed.
+#   Infra changes can be silent (a valid Python change could still break a
+#   template reference), so always validate.
+#
+# ENVIRONMENT:
+#   CodeBuild standard image: aws/codebuild/standard:7.0
+#   Python 3.14 runtime declared in install.runtime-versions.
+#   No VPC config needed — unit tests don't touch AWS resources.
+#   No secrets needed — unit tests mock all AWS calls via moto.
+
+version: 0.2
+
+# ── Environment variables ─────────────────────────────────────────────────────
+# Non-secret values used throughout this build.
+# All ENVIRONMENT=local tells connection.py to use SQLite (not Secrets Manager).
+env:
+  variables:
+    ENVIRONMENT: local
+    # SQLite in-memory database — unit tests don't need PostgreSQL.
+    # The :memory: URL keeps the database in process memory; it's created fresh
+    # for each test session and discarded afterward. No cleanup needed.
+    DATABASE_URL: "sqlite:///:memory:"
+    # Suppress boto3 warnings about missing credentials in unit tests.
+    # moto intercepts all boto3 calls before they reach AWS, but boto3 still
+    # initializes its credential chain at import time. These dummy values
+    # prevent boto3 from printing "No credentials found" warnings that would
+    # clutter the test output and confuse log readers.
+    AWS_ACCESS_KEY_ID: "testing"
+    AWS_SECRET_ACCESS_KEY: "testing"
+    AWS_DEFAULT_REGION: "ap-south-1"
+    # PYTHONPATH: makes `from backend.xxx import yyy` work from the project root.
+    # Without this, Python can't find the `backend` package because it's not
+    # installed — it's just a directory. Adding . (the CodeBuild source root)
+    # to PYTHONPATH tells Python "look here too when resolving imports."
+    PYTHONPATH: "."
+
+phases:
+  install:
+    runtime-versions:
+      # Declare the exact Python version. CodeBuild standard:7.0 includes
+      # Python 3.11, 3.12, and 3.14. Without this declaration, CodeBuild
+      # uses the image default (typically 3.11), which would silently run
+      # tests on the wrong version.
+      python: "3.14"
+    commands:
+      # Upgrade pip first — CodeBuild images ship with older pip versions
+      # that sometimes fail to resolve modern dependency trees correctly.
+      - pip install --upgrade pip --quiet
+      # Install cfn-lint for CloudFormation static analysis.
+      # cfn-lint is NOT in requirements.txt (it's a build tool, not an app dependency).
+      # Pinned version for reproducible builds — cfn-lint updates frequently and
+      # occasionally changes its error codes, which could cause false failures.
+      - pip install cfn-lint==1.30.1 --quiet
+
+  pre_build:
+    commands:
+      # Install backend production dependencies first, then dev dependencies.
+      # Two separate installs mirrors the local dev workflow documented in README.
+      # The -r flag includes all packages from requirements.txt inside requirements-dev.txt,
+      # so technically one command is enough, but explicit ordering makes the log readable.
+      - echo "Installing backend dependencies..."
+      - pip install -r backend/requirements.txt --quiet
+      - pip install -r backend/requirements-dev.txt --quiet
+      - echo "Dependencies installed."
+      # Print the installed versions for debugging. If a test fails due to a
+      # dependency version issue, this output tells you exactly what was installed.
+      - pip list | grep -E "fastapi|sqlalchemy|pytest|moto|psycopg|mangum"
+
+  build:
+    commands:
+      # ── Step 1: Run unit tests ──────────────────────────────────────────────
+      # pytest exits 0 on all-pass, non-zero on any failure.
+      # --tb=short: print shortened tracebacks (full tracebacks in the build log
+      # are verbose; short gives enough information to find the failing line).
+      # -v: verbose output (each test name + PASSED/FAILED — makes log searchable).
+      # If any test fails, pytest exits non-zero → this command fails →
+      # CodeBuild marks the build FAILED → the pipeline stops.
+      - echo "Running backend unit tests..."
+      - pytest tests/unit/ -v --tb=short
+      - echo "All backend unit tests passed."
+
+      # ── Step 2: CloudFormation static analysis (cfn-lint) ──────────────────
+      # cfn-lint validates templates against the CloudFormation resource schema.
+      # It catches: wrong property names, invalid enum values, missing required
+      # fields, incorrect resource type references, and cross-stack dependency issues.
+      # --format json: machine-readable output for CodeBuild log parsing.
+      # --include-checks W: include warnings (not just errors) — useful for
+      # catching non-blocking best practice violations before they become errors.
+      - echo "Running cfn-lint on all CloudFormation templates..."
+      - cfn-lint infrastructure/network.yaml --format json
+      - cfn-lint infrastructure/data.yaml --format json
+      - cfn-lint infrastructure/queues.yaml --format json
+      - cfn-lint infrastructure/api.yaml --format json
+      - cfn-lint infrastructure/worker.yaml --format json
+      - echo "cfn-lint validation passed."
+
+      # ── Step 3: CloudFormation API syntax validation ────────────────────────
+      # validate-template sends the template to CloudFormation's API and gets
+      # a structure validation back. This catches things cfn-lint might miss:
+      # malformed !Sub strings, incorrect Fn::ImportValue references, etc.
+      # Note: validate-template does NOT check that referenced exports exist
+      # (cross-stack imports are validated at deploy time, not validate time).
+      - echo "Running aws cloudformation validate-template..."
+      - aws cloudformation validate-template --template-body file://infrastructure/network.yaml  --region ap-south-1
+      - aws cloudformation validate-template --template-body file://infrastructure/data.yaml     --region ap-south-1
+      - aws cloudformation validate-template --template-body file://infrastructure/queues.yaml   --region ap-south-1
+      - aws cloudformation validate-template --template-body file://infrastructure/api.yaml      --region ap-south-1
+      - aws cloudformation validate-template --template-body file://infrastructure/worker.yaml   --region ap-south-1
+      - echo "CloudFormation template validation passed."
+
+  post_build:
+    commands:
+      # This runs REGARDLESS of whether the build phase succeeded or failed.
+      # Use it for cleanup and summary logging — never for actions that should
+      # only happen on success (those go in build:).
+      - echo "Backend test stage complete."
+      # Log the git commit SHA for traceability. When a deployment later fails,
+      # you want to know exactly which source revision was tested.
+      # CODEBUILD_RESOLVED_SOURCE_VERSION is injected by CodeBuild automatically.
+      - echo "Source revision: $CODEBUILD_RESOLVED_SOURCE_VERSION"
+
+# ── Reports (optional — for CodeBuild Test Reports) ──────────────────────────
+# CodeBuild can parse JUnit XML test results and display them in the Console.
+# To enable: add --junitxml=test-results/junit.xml to the pytest command above,
+# then uncomment the reports section below.
+# This is left disabled for now — the build log output is sufficient for learning.
+#
+# reports:
+#   BackendTestResults:
+#     files:
+#       - "test-results/junit.xml"
+#     file-format: JUNITXML

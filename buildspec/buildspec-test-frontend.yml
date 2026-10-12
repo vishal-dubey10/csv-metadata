@@ -1,0 +1,114 @@
+# buildspec-test-frontend.yml
+#
+# WHAT:
+#   CodeBuild project specification for frontend testing, type checking, and linting.
+#   Runs in parallel with buildspec-test-backend.yml in Stage 2 of the pipeline.
+#
+# WHAT THIS BUILD DOES:
+#   1. Installs Node.js 22 runtime.
+#   2. Runs npm ci (clean, reproducible install from package-lock.json).
+#   3. Runs TypeScript type check (tsc --noEmit — compiles to catch errors, discards output).
+#   4. Runs ESLint with zero-warnings policy.
+#   5. Runs Vitest test suite (28 tests, jsdom environment).
+#   Fails the build if any step exits non-zero.
+#
+# WHY npm ci (not npm install):
+#   npm install resolves dependencies from package.json and CAN update
+#   package-lock.json. In CI, you never want the lock file to change —
+#   two identical commits could produce different builds if a transitive
+#   dependency released a patch between runs.
+#   npm ci reads package-lock.json as the exact specification:
+#   - Deletes node_modules/ first (clean state).
+#   - Installs exactly the versions in the lock file.
+#   - Fails if package.json and package-lock.json are out of sync.
+#   This is faster (~30% faster for large projects) and deterministic.
+#
+# WHY RUN TYPECHECK SEPARATELY FROM THE BUILD:
+#   `npm run build` (tsc -b && vite build) also compiles TypeScript, but it
+#   emits JS output files as a side effect. In the test stage we only want
+#   to catch type errors — we don't want to produce output (that's the build
+#   stage's job). `tsc --noEmit` does a full type check and discards output.
+#   It's also faster than a full build because Vite's bundling step is skipped.
+#
+# ENVIRONMENT:
+#   CodeBuild standard image: aws/codebuild/standard:7.0
+#   Node.js 22 runtime declared in install.runtime-versions.
+#   No AWS credentials needed — frontend tests don't call AWS services.
+#   jsdom simulates a browser DOM inside Node — no real browser required.
+
+version: 0.2
+
+env:
+  variables:
+    # NODE_ENV=test is the conventional signal to tools that this is a test run.
+    # Some libraries behave differently in test mode (e.g., disable production
+    # optimizations, enable verbose error messages).
+    NODE_ENV: test
+    # CI=true tells several tools (Vitest, eslint) to use non-interactive output
+    # modes (no color codes, no spinner, no progress bars) suitable for log files.
+    # npm itself reads this variable — when CI=true, npm treats warnings as errors.
+    CI: "true"
+
+phases:
+  install:
+    runtime-versions:
+      # Node.js 22 matches the version used in local development (package.json
+      # engines field would pin this; we don't have that field but use the same
+      # major version). Vite 8 and React 19 require Node.js >= 18.
+      nodejs: "22"
+    commands:
+      - echo "Node.js version:" && node --version
+      - echo "npm version:" && npm --version
+
+  pre_build:
+    commands:
+      - echo "Installing frontend dependencies via npm ci..."
+      - cd frontend
+      # npm ci: clean install from package-lock.json. See WHY above.
+      # --prefer-offline: use the npm cache if available (speeds up repeat builds).
+      - npm ci --prefer-offline
+      - echo "Dependencies installed."
+      # Print key dependency versions for debugging.
+      - npm list react typescript vite vitest --depth=0 2>/dev/null || true
+
+  build:
+    commands:
+      # All commands run inside the frontend/ directory (cd in pre_build persists).
+
+      # ── Step 1: TypeScript type check ──────────────────────────────────────
+      # tsc --noEmit: full type check, no output files produced.
+      # -p tsconfig.app.json: use the app-specific tsconfig (not tsconfig.node.json
+      # which is for the Vite config file itself).
+      # Catches: type errors in React components, missing imports, incorrect
+      # prop types, undefined variable references.
+      # If this fails, you have a type error that would compile to broken JS.
+      - echo "Running TypeScript type check..."
+      - npm run typecheck
+      - echo "TypeScript check passed."
+
+      # ── Step 2: ESLint ─────────────────────────────────────────────────────
+      # eslint src --report-unused-disable-directives --max-warnings 0
+      # (This is what `npm run lint` runs — defined in package.json.)
+      # --max-warnings 0: treat ANY warning as a failure.
+      # This enforces a zero-tolerance policy for lint issues in CI.
+      # Locally you might see warnings and ignore them; in CI, warnings fail
+      # the build, forcing them to be fixed before merging.
+      - echo "Running ESLint..."
+      - npm run lint
+      - echo "ESLint passed."
+
+      # ── Step 3: Vitest tests ────────────────────────────────────────────────
+      # npm test runs: vitest run
+      # The `run` flag (defined in package.json) means: run once and exit.
+      # Without `run`, vitest starts in watch mode and the CodeBuild process
+      # would hang forever waiting for file changes.
+      # Tests run in jsdom environment (simulated browser DOM).
+      # 28 tests across 3 test files.
+      - echo "Running frontend tests..."
+      - npm test
+      - echo "Frontend tests passed."
+
+  post_build:
+    commands:
+      - echo "Frontend test stage complete."
+      - echo "Source revision: $CODEBUILD_RESOLVED_SOURCE_VERSION"

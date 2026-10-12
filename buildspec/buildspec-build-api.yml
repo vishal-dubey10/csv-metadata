@@ -1,0 +1,173 @@
+# buildspec-build-api.yml
+#
+# WHAT:
+#   CodeBuild project specification for packaging the API Lambda ZIP artifact.
+#   Runs in Stage 3 of the pipeline, after tests pass.
+#
+# WHAT THIS BUILD PRODUCES:
+#   A ZIP file at s3://csvforge-pipeline-artifacts-dev/api/csvforge-api-{git-sha}.zip
+#   This ZIP contains:
+#     - backend/ package (all route handlers, ORM models, clients, schemas)
+#     - All production Python dependencies (from backend/requirements.txt)
+#   It does NOT contain:
+#     - worker/ (the worker has its own container image)
+#     - tests/ (never in production artifacts)
+#     - requirements-dev.txt packages (no pytest, moto, httpx2 in production)
+#
+# WHY A ZIP (not container image) FOR THE API LAMBDA:
+#   The API Lambda has no binary C extensions. Every dependency in
+#   backend/requirements.txt ships as a pure Python wheel or as a wheel
+#   with pre-built binaries for multiple platforms (e.g., pydantic-core).
+#   A ZIP deployment is simpler, faster to build and deploy, and cheaper
+#   than an ECR container image for pure-Python code. AD-06.
+#
+# WHY PIP INSTALL INTO A DIRECTORY (-t package/):
+#   Lambda adds the ZIP root to sys.path. If we just zipped the source files
+#   without dependencies, Lambda would fail on `import fastapi` because fastapi
+#   is not installed in Lambda's managed runtime. Installing into package/ and
+#   then zipping the whole package/ directory makes every installed package
+#   importable from the ZIP root.
+#
+# ARTIFACT NAMING (git SHA):
+#   The ZIP is uploaded to S3 with the git commit SHA in the key:
+#     api/csvforge-api-{CODEBUILD_RESOLVED_SOURCE_VERSION}.zip
+#   This enables rollback: old ZIPs remain in S3 and can be re-deployed by
+#   passing the SHA to the deploy stage. `latest` tags are not used because
+#   they make rollback ambiguous — "latest" always points to the newest build.
+#
+# IAM PERMISSIONS NEEDED ON THE CODEBUILD ROLE:
+#   s3:PutObject on arn:aws:s3:::csvforge-pipeline-artifacts-dev/api/*
+#   (Granted by the pipeline IAM role defined in pipeline.yaml)
+
+version: 0.2
+
+env:
+  variables:
+    ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
+    AWS_DEFAULT_REGION: "ap-south-1"
+
+phases:
+  install:
+    runtime-versions:
+      # Must match the Lambda runtime in api.yaml (Runtime: python3.14).
+      # Installing dependencies on 3.14 ensures any platform-specific wheels
+      # are compiled for the correct Python ABI.
+      python: "3.14"
+    commands:
+      - pip install --upgrade pip --quiet
+
+  pre_build:
+    commands:
+      # Capture the git commit SHA for artifact naming.
+      # CODEBUILD_RESOLVED_SOURCE_VERSION is set by CodeBuild to the full 40-char SHA.
+      # We use the first 8 characters for readability — still unique enough for a
+      # single repository (collision probability is negligible below billions of commits).
+      - export GIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - export ZIP_KEY="api/csvforge-api-${GIT_SHA}.zip"
+      - echo "Building artifact for commit $GIT_SHA"
+      - echo "Artifact key: s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+      # Create a clean build directory.
+      # Using a separate directory (not the source root) keeps the build clean:
+      # we can zip the entire directory without accidentally including test files,
+      # .git/, .env, or other non-production files.
+      - mkdir -p package
+
+  build:
+    commands:
+      # ── Step 1: Install production dependencies into package/ ───────────────
+      # pip install -t TARGET installs packages into TARGET instead of the
+      # default site-packages. The installed packages land flat in package/,
+      # making them directly importable when package/ is the ZIP root.
+      #
+      # --no-deps would skip transitive dependencies (dangerous — don't use it).
+      # --quiet suppresses per-package download progress (keeps log readable).
+      # We install ONLY requirements.txt (not requirements-dev.txt) —
+      # test tools like pytest and moto must never appear in a production artifact.
+      - echo "Installing production dependencies..."
+      - pip install -r backend/requirements.txt -t package/ --quiet
+      - echo "Dependencies installed. Package size so far:"
+      - du -sh package/
+
+      # ── Step 2: Copy backend application code into package/ ─────────────────
+      # The backend/ directory is the Python package that Lambda will import.
+      # It must be at the root of the ZIP so `import backend.main` resolves to
+      # package/backend/main.py after the ZIP is extracted.
+      - echo "Copying backend source..."
+      - cp -r backend package/
+      # Verify the structure before zipping. This makes the log readable and
+      # catches any accidental missing files before the ZIP is created.
+      - echo "Package structure:"
+      - ls package/backend/
+
+      # ── Step 3: Remove unnecessary files to reduce ZIP size ─────────────────
+      # __pycache__ directories contain compiled bytecode (.pyc files).
+      # Lambda regenerates these at cold start — including them in the ZIP adds
+      # size without benefit. Removing them can reduce the ZIP by 10–20%.
+      # *.dist-info directories are pip metadata — not needed at runtime.
+      - echo "Cleaning build artifacts..."
+      - find package/ -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+      - find package/ -type d -name "*.dist-info" -exec rm -rf {} + 2>/dev/null || true
+      - find package/ -type d -name "*.egg-info"  -exec rm -rf {} + 2>/dev/null || true
+      # Remove test directories from installed packages (some packages include
+      # their own tests — we don't need them in production).
+      - find package/ -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+
+      # ── Step 4: Create the ZIP archive ──────────────────────────────────────
+      # -r: recursive (include all subdirectories)
+      # -9: maximum compression level (~30-40% smaller than no compression)
+      #     Lambda has a 250 MB unzipped limit — compression helps stay under it.
+      # The ZIP is created in /tmp to keep it out of the source tree.
+      # We cd into package/ first so the ZIP root matches the package/ directory
+      # structure (not package/package/backend/...).
+      - echo "Creating ZIP archive..."
+      - cd package && zip -r9 /tmp/csvforge-api.zip . && cd ..
+      - echo "ZIP created. Size:"
+      - du -sh /tmp/csvforge-api.zip
+
+      # ── Step 5: Upload to S3 artifact bucket ────────────────────────────────
+      # The ZIP is uploaded with the git SHA in the key — see ARTIFACT NAMING above.
+      # We also upload a "latest" marker file (not the ZIP itself) that contains
+      # the current SHA. Downstream stages read this file to find the right ZIP
+      # without needing to pass the SHA through the pipeline as an environment variable.
+      - echo "Uploading artifact to S3..."
+      - aws s3 cp /tmp/csvforge-api.zip "s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+      - echo "$GIT_SHA" | aws s3 cp - "s3://$ARTIFACT_BUCKET/api/latest-sha.txt"
+      - echo "Artifact uploaded: s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+
+      # ── Step 6: Write artifact metadata for downstream stages ───────────────
+      # CodeBuild outputs this file as an artifact so the deploy stage can read
+      # the ZIP key without re-computing it. This is an alternative to environment
+      # variable passing (which isn't supported across CodePipeline stages natively).
+      - |
+        cat > /tmp/api-artifact-meta.json << EOF
+        {
+          "git_sha": "$GIT_SHA",
+          "zip_key": "$ZIP_KEY",
+          "bucket": "$ARTIFACT_BUCKET",
+          "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        }
+        EOF
+      - cat /tmp/api-artifact-meta.json
+      - aws s3 cp /tmp/api-artifact-meta.json "s3://$ARTIFACT_BUCKET/api/latest-meta.json"
+
+  post_build:
+    commands:
+      - echo "API build complete."
+      - echo "Source revision: $CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - |
+        echo "Deploy command (for reference):"
+        echo "aws lambda update-function-code \\"
+        echo "  --function-name csvforge-api-dev \\"
+        echo "  --s3-bucket $ARTIFACT_BUCKET \\"
+        echo "  --s3-key api/csvforge-api-$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8).zip"
+
+# ── Output artifact ───────────────────────────────────────────────────────────
+# This artifact definition tells CodePipeline to pass the meta file to the
+# next stage. The deploy buildspec reads it to find the ZIP key.
+# Note: the ZIP itself is in S3; we only pass the metadata file as an artifact
+# (the ZIP is too large to pass through CodePipeline's artifact mechanism efficiently).
+artifacts:
+  files:
+    - /tmp/api-artifact-meta.json
+  name: APIArtifactMeta
+  discard-paths: yes

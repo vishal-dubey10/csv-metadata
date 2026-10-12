@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge Pipeline Bootstrap — Artifact bucket and GitHub connection.
+
+  WHAT THIS TEMPLATE DOES:
+    Creates two prerequisite resources that the main pipeline stack depends on.
+    These are separated from the pipeline itself because:
+      1. The artifact bucket must exist BEFORE CodePipeline is created
+         (CodePipeline requires a valid artifact store on stack creation).
+      2. The GitHub connection requires a MANUAL approval step in the AWS Console
+         after CloudFormation creates it — it starts in PENDING state and the
+         pipeline will fail if it's referenced before approval.
+
+  DEPLOY THIS STACK FIRST, before csvforge-pipeline-dev.
+
+  MANUAL STEP REQUIRED AFTER DEPLOY:
+    1. Go to AWS Console → Developer Tools → Connections.
+    2. Find "csvforge-github-connection".
+    3. Click "Update pending connection".
+    4. Authorize the GitHub App for your GitHub account/organization.
+    5. The connection status changes from PENDING to AVAILABLE.
+    Only after this step will the Source stage of the pipeline work.
+
+  HOW TO DEPLOY:
+    aws cloudformation deploy \
+      --template-file infrastructure/pipeline-bootstrap.yaml \
+      --stack-name csvforge-pipeline-bootstrap-dev \
+      --region ap-south-1
+
+  COST:
+    S3 bucket: fractions of a cent for typical artifact storage (<100 MB).
+    Versioning adds storage for each version — old versions auto-expire via
+    the lifecycle rule below (keep 30 days of pipeline artifacts).
+    CodeConnections: no charge for the connection itself.
+
+  NAMING CONVENTION:
+    csvforge-pipeline-artifacts-dev  — the artifact bucket
+    csvforge-github-connection       — not environment-specific; one connection
+                                       per GitHub account/org serves all envs.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment suffix for resource names.
+
+Resources:
+
+  # ── Artifact S3 Bucket ─────────────────────────────────────────────────────
+  # This bucket is CodePipeline's internal plumbing. Every artifact that passes
+  # between stages — source ZIP, test reports, Lambda ZIP, frontend dist — is
+  # stored here as an S3 object.
+  #
+  # WHY VERSIONING IS REQUIRED:
+  #   CodePipeline uses S3 object versioning to track artifacts. When Stage 2
+  #   (Build) consumes the source artifact produced by Stage 1 (Source), it
+  #   references a specific version ID, not just the latest object. Without
+  #   versioning, two pipeline executions running concurrently could corrupt
+  #   each other's artifacts by overwriting the same key.
+  #
+  # WHY NOT USE THE APPLICATION DATA BUCKET (csvforge-files-dev):
+  #   Mixing build artifacts with application data creates audit confusion and
+  #   makes cleanup difficult. A dedicated bucket also lets you apply a strict
+  #   bucket policy scoped to only CodePipeline and CodeBuild roles.
+  #
+  # ENCRYPTION:
+  #   SSE-S3 (AES-256) encrypts every artifact at rest. For stricter compliance
+  #   (audit logs, key rotation control), replace with SSE-KMS. For dev, SSE-S3
+  #   is sufficient and costs nothing extra.
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "csvforge-pipeline-artifacts-${Environment}"
+
+      # Versioning: REQUIRED by CodePipeline.
+      VersioningConfiguration:
+        Status: Enabled
+
+      # Block all public access — build artifacts must never be public.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+      # Encryption at rest.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      # Lifecycle rules: expire old artifact versions automatically.
+      # Without this, every pipeline run accumulates artifact versions forever.
+      # At ~5 MB per run, 100 runs/month = 500 MB = ~$0.01/month — small but
+      # grows without bound. The rule below keeps the current version and
+      # deletes non-current (old) versions after 30 days.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifactVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            # Also clean up incomplete multipart uploads.
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  # ── GitHub Connection (CodeConnections) ────────────────────────────────────
+  # CodeConnections creates a GitHub App installation that CodePipeline uses
+  # to access the repository. This replaces the deprecated GitHub OAuth app
+  # approach (personal access tokens).
+  #
+  # HOW IT WORKS:
+  #   1. CloudFormation creates the connection in PENDING state.
+  #   2. You manually approve it in the Console (see MANUAL STEP above).
+  #   3. AWS installs a GitHub App on your GitHub account.
+  #   4. The connection ARN is used in the pipeline Source action.
+  #
+  # WHY ONE CONNECTION FOR ALL ENVIRONMENTS:
+  #   A connection represents access to a GitHub account or organization —
+  #   not to a specific repo or branch. One connection can serve multiple
+  #   pipelines (dev, staging, prod) pointing to different branches of the
+  #   same repo. Creating one per environment is wasteful and requires more
+  #   GitHub App installations.
+  #
+  # SECURITY:
+  #   The connection grants CodePipeline read-only access to the repo.
+  #   The GitHub App installation can be scoped to specific repositories.
+  #   AWS does not store your GitHub credentials — the App token is managed
+  #   by the GitHub App protocol and never appears in CloudFormation or IAM.
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    Properties:
+      ConnectionName: csvforge-github-connection
+      ProviderType: GitHub
+      # Tags help you identify this connection in the Console.
+      Tags:
+        - Key: Project
+          Value: csvforge
+        - Key: ManagedBy
+          Value: cloudformation
+
+Outputs:
+  ArtifactBucketName:
+    Description: >
+      Name of the S3 artifact bucket. Pass this to the pipeline stack as
+      ArtifactBucketName parameter:
+        --parameter-overrides ArtifactBucketName=csvforge-pipeline-artifacts-dev
+    Value: !Ref PipelineArtifactBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactBucketName"
+
+  ArtifactBucketArn:
+    Description: ARN of the artifact bucket. Used in CodeBuild and pipeline IAM policies.
+    Value: !GetAtt PipelineArtifactBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ArtifactBucketArn"
+
+  GitHubConnectionArn:
+    Description: >
+      ARN of the GitHub connection. Pass to the pipeline stack as GitHubConnectionArn.
+      STATUS MUST BE "AVAILABLE" (not PENDING) before the pipeline Source stage works.
+      Check: aws codeconnections get-connection --connection-arn <this ARN>
+    Value: !Ref GitHubConnection
+    Export:
+      Name: !Sub "${AWS::StackName}-GitHubConnectionArn"
+
+  ConnectionStatus:
+    Description: >
+      Reminder: check connection status before deploying the pipeline.
+      aws codeconnections get-connection \
+        --connection-arn <GitHubConnectionArn> \
+        --query Connection.ConnectionStatus \
+        --output text
+      Must return AVAILABLE (not PENDING) for the Source stage to work.
+    Value: "Check Console → Developer Tools → Connections → Update pending connection"
