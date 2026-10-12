@@ -5,13 +5,34 @@
       "Sid": "S3PresignedUpload",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::csvforge-files-dev/uploads/*"
+      "Resource": "arn:aws:s3:::csvforge-files-dev/uploads/*",
+      "_comment": "s3:PutObject on uploads/* is required to generate presigned PUT URLs. The AWS SDK signs the URL using the caller's credentials. If the role lacked s3:PutObject here, generate_presigned_upload_url() would produce a URL that S3 rejects with 403 when the browser tries to use it."
+    },
+    {
+      "Sid": "S3VerifyUpload",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:HeadObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::csvforge-files-dev/uploads/*",
+        "arn:aws:s3:::csvforge-files-dev/processed/*"
+      ],
+      "_comment": "s3:GetObject is required to generate presigned GET URLs (download endpoint). s3:HeadObject is required for object_exists() and get_object_size() called in POST /uploads/{job_id}/complete — the API verifies the file was uploaded and checks its size via HeadObject before transitioning the job to queued. Both uploads/* and processed/* are included because the download presigned URL covers processed/* objects."
     },
     {
       "Sid": "SQSPublish",
       "Effect": "Allow",
       "Action": ["sqs:SendMessage"],
       "Resource": "arn:aws:sqs:ap-south-1:*:csvforge-jobs-dev"
+    },
+    {
+      "Sid": "SecretsManagerDBCredentials",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:ap-south-1:*:secret:csvforge-db-credentials-dev*",
+      "_comment": "Required for ENVIRONMENT=production. The API Lambda calls _build_database_url() at module import time to fetch the DB password from Secrets Manager. Same cold-start failure mode as the worker if this is absent."
     }
   ]
 }

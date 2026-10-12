@@ -705,3 +705,53 @@ def admin_list_jobs(
     # from a cross-origin request. (CORSMiddleware expose_headers handles this
     # globally; this line is a belt-and-suspenders reminder for documentation.)
     return [_job_to_admin_response(j) for j in jobs]
+
+
+# ── AWS Lambda entry point ────────────────────────────────────────────────────
+# Mangum wraps the FastAPI ASGI app so it can be called by AWS Lambda.
+#
+# HOW THIS WORKS:
+#   Lambda's handler protocol expects a callable with signature:
+#       def handler(event: dict, context: object) -> dict
+#   FastAPI is an ASGI application — it expects ASGI scope/receive/send callables,
+#   not a Lambda event dict. Mangum bridges the gap:
+#     1. Lambda calls handler(event, context).
+#     2. Mangum translates the API Gateway HTTP event into ASGI format.
+#     3. Mangum passes the ASGI request to FastAPI's app(scope, receive, send).
+#     4. FastAPI processes the request, runs middleware, resolves dependencies,
+#        calls the route handler, and produces an ASGI response.
+#     5. Mangum translates the ASGI response back into the Lambda response dict.
+#     6. Lambda returns the dict to API Gateway, which sends the HTTP response.
+#
+# WHY `handler` (not `mangum_handler` or any other name):
+#   The CloudFormation api.yaml template sets:
+#       Handler: backend.main.handler
+#   Lambda resolves this as:
+#       import backend.main
+#       fn = backend.main.handler   ← must exist as a module-level attribute
+#       fn(event, context)
+#   The name `handler` must match exactly what is in the CloudFormation Handler property.
+#   If it were named differently, Lambda would raise Runtime.HandlerNotFound and
+#   API Gateway would return HTTP 502 to every caller.
+#
+# LIFESPAN behavior (Mangum 0.22+):
+#   lifespan="off" disables ASGI lifespan events (startup/shutdown).
+#   FastAPI supports lifespan events for things like database connection pool
+#   initialisation. We do not use them here (the Engine is created at module
+#   import time, not via lifespan). Setting "off" avoids Mangum sending ASGI
+#   lifespan events that FastAPI would handle but Lambda containers make
+#   unnecessary — it reduces cold start overhead slightly.
+#
+# LOCAL DEVELOPMENT:
+#   When running with Uvicorn (`uvicorn backend.main:app --reload`), this line
+#   is imported but `handler` is never called — Uvicorn calls `app` directly
+#   via ASGI. The Mangum wrapper is inert locally. No conditional import is needed.
+#
+# API GATEWAY PAYLOAD FORMAT:
+#   api.yaml configures PayloadFormatVersion: "2.0" on the Lambda integration.
+#   Mangum 0.22.0 defaults to handling format 2.0. The JWT claims from the
+#   API Gateway JWT Authoriser are at:
+#       scope["aws.event"]["requestContext"]["authorizer"]["jwt"]["claims"]
+#   This is read by get_current_user() in backend/auth.py.
+from mangum import Mangum
+handler = Mangum(app, lifespan="off")
