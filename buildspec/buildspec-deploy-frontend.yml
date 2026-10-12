@@ -1,0 +1,187 @@
+# buildspec-deploy-frontend.yml
+#
+# WHAT:
+#   Builds the React frontend with production environment values and deploys
+#   it to the private S3 bucket, then invalidates the CloudFront cache.
+#   Runs in Stage 4 of the pipeline.
+#
+# WHY THE BUILD HAPPENS HERE (not in the build stage):
+#   Unlike Lambda (where you build an artifact and deploy it separately),
+#   the frontend build must embed VITE_ environment variables at compile time.
+#   VITE_COGNITO_USER_POOL_ID and VITE_API_URL are injected as literal strings
+#   into the JavaScript bundle by Vite. They don't exist as runtime env vars.
+#   These values come from SSM Parameter Store (written after CloudFormation
+#   stacks are deployed). Building in Stage 3 would require passing SSM values
+#   forward as pipeline artifacts — complex and fragile. Building here keeps
+#   the SSM read and the build in the same step.
+#
+# SSM PARAMETER STORE (not Secrets Manager):
+#   Cognito pool ID, client ID, and the API Gateway URL are NOT secrets —
+#   they're public client-side configuration. SSM Parameter Store (standard tier)
+#   is free and appropriate for non-secret configuration. Secrets Manager costs
+#   $0.40/secret/month and adds rotation machinery we don't need here.
+#
+#   Parameters expected in SSM (create these after deploying the api.yaml stack):
+#     /csvforge/dev/cognito-user-pool-id    ← from api.yaml Output CognitoUserPoolId
+#     /csvforge/dev/cognito-app-client-id   ← from api.yaml Output CognitoAppClientId
+#     /csvforge/dev/api-gateway-url         ← from api.yaml Output APIEndpoint
+#     /csvforge/dev/frontend-bucket-name    ← from frontend.yaml Output FrontendBucketName
+#     /csvforge/dev/cloudfront-dist-id      ← from frontend.yaml Output CloudFrontDistributionId
+#
+# CACHING HEADERS (how browser caching is managed):
+#   index.html → Cache-Control: no-cache, no-store, must-revalidate
+#     Browsers and CloudFront always re-fetch index.html. This ensures users
+#     see the new version immediately after a deploy.
+#   assets/* → Cache-Control: public, max-age=31536000, immutable
+#     Assets have content-hash filenames (e.g., main-a3f9c12.js). The same
+#     name always means the same content. Caching forever is safe.
+#     `immutable` tells the browser: don't even revalidate, ever.
+#   These headers are set on the S3 objects via `aws s3 sync --cache-control`.
+#
+# CLOUDFRONT INVALIDATION:
+#   After syncing to S3, CloudFront edge caches still have old versions.
+#   Invalidating /* tells all edge locations to discard their cached copies.
+#   Cost: first 1,000 paths/month free. /* counts as one path.
+#   Duration: 30–60 seconds typically. The pipeline doesn't wait for completion —
+#   the smoke test runs after a brief pause to allow propagation.
+#
+# IAM PERMISSIONS NEEDED:
+#   s3:PutObject, s3:DeleteObject, s3:ListBucket on csvforge-frontend-dev/*
+#   cloudfront:CreateInvalidation on the distribution ARN
+#   ssm:GetParameter on /csvforge/dev/* paths
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-south-1"
+    SSM_PREFIX: "/csvforge/dev"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: "22"
+    commands:
+      - echo "Node.js version:" && node --version
+
+  pre_build:
+    commands:
+      # ── Step 1: Read deployment configuration from SSM ───────────────────────
+      # All values come from SSM — never from Git, never from pipeline env vars
+      # (which would be visible in the CodeBuild console).
+      - echo "Reading deployment configuration from SSM..."
+      - |
+        export COGNITO_POOL_ID=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/cognito-user-pool-id" \
+          --query Parameter.Value --output text)
+        export COGNITO_CLIENT_ID=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/cognito-app-client-id" \
+          --query Parameter.Value --output text)
+        export API_URL=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/api-gateway-url" \
+          --query Parameter.Value --output text)
+        export FRONTEND_BUCKET=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/frontend-bucket-name" \
+          --query Parameter.Value --output text)
+        export CLOUDFRONT_DIST_ID=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/cloudfront-dist-id" \
+          --query Parameter.Value --output text)
+
+      # Confirm values were read (log names, never values for secrets — these
+      # aren't secrets but keeping a consistent habit is good practice).
+      - echo "  Cognito Pool ID:    configured ($(echo $COGNITO_POOL_ID | cut -c1-10)...)"
+      - echo "  API URL:            $API_URL"
+      - echo "  Frontend bucket:    $FRONTEND_BUCKET"
+      - echo "  CloudFront dist ID: $CLOUDFRONT_DIST_ID"
+
+      # ── Step 2: Write .env.production for Vite ──────────────────────────────
+      # Vite reads .env.production during `vite build`.
+      # Variables prefixed with VITE_ are embedded in the JS bundle as literals.
+      # This file is written at build time and never committed to Git.
+      - cd frontend
+      - |
+        cat > .env.production << EOF
+        VITE_API_URL=$API_URL
+        VITE_COGNITO_USER_POOL_ID=$COGNITO_POOL_ID
+        VITE_COGNITO_APP_CLIENT_ID=$COGNITO_CLIENT_ID
+        VITE_AWS_REGION=ap-south-1
+        EOF
+      - echo ".env.production written (VITE_ values embedded at build time)."
+
+      # ── Step 3: Install dependencies ─────────────────────────────────────────
+      - npm ci --prefer-offline
+
+  build:
+    commands:
+      # ── Step 4: TypeScript compile + Vite bundle ─────────────────────────────
+      # npm run build = tsc -b && vite build
+      # tsc -b: compiles TypeScript and checks types. Fail here = type error.
+      # vite build: bundles, minifies, and hashes asset filenames.
+      # Output: frontend/dist/ containing index.html + assets/
+      - echo "Building frontend..."
+      - npm run build
+      - echo "Build complete. Output:"
+      - ls -lh dist/
+      - du -sh dist/
+
+      # ── Step 5: Sync index.html with no-cache headers ────────────────────────
+      # Upload index.html first, separately, with no-cache headers.
+      # This file must always be fresh — it's the entry point that references
+      # the content-hashed asset files.
+      - echo "Uploading index.html (no-cache)..."
+      - |
+        aws s3 cp dist/index.html "s3://$FRONTEND_BUCKET/index.html" \
+          --cache-control "no-cache, no-store, must-revalidate" \
+          --content-type "text/html"
+
+      # ── Step 6: Sync all other assets with immutable cache headers ────────────
+      # Exclude index.html (already uploaded). Include everything in assets/.
+      # --cache-control sets the S3 object metadata Cache-Control header.
+      # CloudFront respects this header and passes it to the browser.
+      # --delete: remove S3 objects that no longer exist in the local dist/.
+      #   This cleans up old hashed assets from previous deploys.
+      #   Safe because old assets are referenced only by old index.html versions,
+      #   which are no longer served (index.html was just updated above).
+      - echo "Uploading assets (immutable cache)..."
+      - |
+        aws s3 sync dist/ "s3://$FRONTEND_BUCKET/" \
+          --exclude "index.html" \
+          --cache-control "public, max-age=31536000, immutable" \
+          --delete
+
+      # ── Step 7: CloudFront cache invalidation ────────────────────────────────
+      # Tell all CloudFront edge locations to discard cached copies.
+      # "/*" invalidates all paths — one path = one invalidation unit.
+      # The command returns immediately; invalidation propagates asynchronously
+      # (typically completes within 60 seconds globally).
+      # The smoke test stage runs after this; it includes a brief wait to allow
+      # the invalidation to propagate before checking the CloudFront URL.
+      - echo "Invalidating CloudFront cache..."
+      - |
+        INVALIDATION_ID=$(aws cloudfront create-invalidation \
+          --distribution-id "$CLOUDFRONT_DIST_ID" \
+          --paths "/*" \
+          --query Invalidation.Id \
+          --output text)
+        echo "Invalidation created: $INVALIDATION_ID"
+        echo "Invalidation propagates asynchronously (30-60 seconds)."
+
+      # ── Step 8: Record the deployment ────────────────────────────────────────
+      - export GIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - |
+        cat > /tmp/frontend-deploy-record.json << EOF
+        {
+          "git_sha": "$GIT_SHA",
+          "frontend_bucket": "$FRONTEND_BUCKET",
+          "cloudfront_dist_id": "$CLOUDFRONT_DIST_ID",
+          "invalidation_id": "$INVALIDATION_ID",
+          "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "pipeline_execution": "$CODEPIPELINE_EXECUTION_ID"
+        }
+        EOF
+      - aws s3 cp /tmp/frontend-deploy-record.json "s3://csvforge-pipeline-artifacts-dev/deployments/frontend/current.json"
+
+  post_build:
+    commands:
+      - echo "Frontend deploy complete."
+      - echo "CloudFront URL: https://$(aws cloudfront get-distribution --id $CLOUDFRONT_DIST_ID --query 'Distribution.DomainName' --output text)"

@@ -1,0 +1,223 @@
+# buildspec-smoke-test.yml
+#
+# WHAT:
+#   Post-deployment smoke tests. Verifies that all three deployed components
+#   (API Lambda, frontend, worker) are alive and serving traffic.
+#   Runs in Stage 5 of the pipeline, after all deploy stages complete.
+#
+# WHAT THIS BUILD TESTS:
+#   1. /health endpoint → HTTP 200, {"status": "ok"} (no auth required)
+#   2. GET /jobs → HTTP 200 with valid Cognito token (tests JWT auth path)
+#   3. Frontend CloudFront URL → HTTP 200, HTML body contains "CSVForge"
+#   Each test: if non-200, exit non-zero → pipeline fails → on-call paged.
+#
+# WHAT THIS DOES NOT TEST:
+#   - End-to-end upload → process → download (too slow, needs a real CSV)
+#   - SQS → Lambda worker trigger (asynchronous; not a pipeline gate)
+#   - Database query correctness (integration test concern)
+#   These are run manually or in a separate scheduled integration test job.
+#
+# SSM PARAMETERS REQUIRED:
+#   /csvforge/dev/api-gateway-url         ← HTTPS URL for the API
+#   /csvforge/dev/cloudfront-url          ← HTTPS URL for the frontend
+#   /csvforge/dev/cognito-app-client-id   ← for InitiateAuth call
+#   /csvforge/dev/smoke-test-username     ← CI test user email (not a secret)
+#   /csvforge/dev/smoke-test-password     ← CI test user password (SecureString)
+#
+# THE SMOKE TEST USER:
+#   A dedicated Cognito user created once for CI: ci@csvforge.internal
+#   Its password is stored in SSM as a SecureString (KMS-encrypted, never logged).
+#   It has no admin group membership — it can only call user-facing endpoints.
+#   Creation command (run once after deploying the Cognito user pool):
+#     POOL_ID=$(aws cloudformation describe-stacks \
+#       --stack-name csvforge-api-dev \
+#       --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue" \
+#       --output text)
+#     aws cognito-idp admin-create-user \
+#       --user-pool-id $POOL_ID \
+#       --username ci@csvforge.internal \
+#       --temporary-password 'TempCI1!' \
+#       --message-action SUPPRESS
+#     aws cognito-idp admin-set-user-password \
+#       --user-pool-id $POOL_ID \
+#       --username ci@csvforge.internal \
+#       --password 'PERMANENT_PASSWORD' \
+#       --permanent
+#     aws ssm put-parameter \
+#       --name /csvforge/dev/smoke-test-username \
+#       --value ci@csvforge.internal \
+#       --type String
+#     aws ssm put-parameter \
+#       --name /csvforge/dev/smoke-test-password \
+#       --value 'PERMANENT_PASSWORD' \
+#       --type SecureString
+#
+# IAM PERMISSIONS NEEDED:
+#   ssm:GetParameter on /csvforge/dev/* (including the SecureString password)
+#   kms:Decrypt on the SSM encryption key (for SecureString parameters)
+#   No direct AWS service permissions — tests call the public API endpoints
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-south-1"
+    SSM_PREFIX: "/csvforge/dev"
+    # How long to wait for CloudFront invalidation to propagate before testing.
+    # 60 seconds is usually sufficient; increase if tests flake on the frontend check.
+    CLOUDFRONT_WAIT_SECONDS: "60"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.14"
+    commands:
+      # curl is available on CodeBuild standard images — no install needed.
+      # python3 is used for JSON parsing — already installed via runtime-versions.
+      - echo "Smoke test runner ready."
+      - curl --version | head -1
+
+  pre_build:
+    commands:
+      # ── Step 1: Read configuration from SSM ─────────────────────────────────
+      - echo "Reading smoke test configuration from SSM..."
+      - |
+        export API_URL=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/api-gateway-url" \
+          --query Parameter.Value --output text)
+        export CLOUDFRONT_URL=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/cloudfront-url" \
+          --query Parameter.Value --output text)
+        export COGNITO_CLIENT_ID=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/cognito-app-client-id" \
+          --query Parameter.Value --output text)
+        # --with-decryption required for SecureString parameters.
+        # The value is stored in a shell variable, never echoed to the log.
+        export SMOKE_USERNAME=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/smoke-test-username" \
+          --query Parameter.Value --output text)
+        export SMOKE_PASSWORD=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/smoke-test-password" \
+          --with-decryption \
+          --query Parameter.Value --output text)
+      - echo "  API URL:         $API_URL"
+      - echo "  CloudFront URL:  $CLOUDFRONT_URL"
+      - echo "  Smoke user:      $SMOKE_USERNAME"
+      # DELIBERATELY DO NOT echo SMOKE_PASSWORD — it must never appear in logs.
+
+      # ── Step 2: Wait for CloudFront invalidation to propagate ────────────────
+      # The deploy stage triggered an invalidation but didn't wait for it.
+      # We wait here so the frontend smoke test hits the new version.
+      - echo "Waiting ${CLOUDFRONT_WAIT_SECONDS}s for CloudFront propagation..."
+      - sleep $CLOUDFRONT_WAIT_SECONDS
+
+  build:
+    commands:
+      # ── Test 1: Health endpoint ──────────────────────────────────────────────
+      # The /health endpoint requires no auth. If this fails, the Lambda itself
+      # didn't initialize — broken ZIP, handler not found, cold start crash.
+      # Expected: HTTP 200, body: {"status":"ok","environment":"production"}
+      - echo "=== Test 1: Health endpoint ==="
+      - |
+        HTTP_STATUS=$(curl -s -o /tmp/health_response.json -w "%{http_code}" "$API_URL/health")
+        echo "  Status: $HTTP_STATUS"
+        echo "  Body:   $(cat /tmp/health_response.json)"
+        if [ "$HTTP_STATUS" != "200" ]; then
+          echo "FAIL: /health returned $HTTP_STATUS (expected 200)"
+          exit 1
+        fi
+        STATUS_FIELD=$(python3 -c "import json; print(json.load(open('/tmp/health_response.json'))['status'])")
+        if [ "$STATUS_FIELD" != "ok" ]; then
+          echo "FAIL: health response has status=$STATUS_FIELD (expected ok)"
+          exit 1
+        fi
+      - echo "  PASS: /health returned 200 with status=ok"
+
+      # ── Test 2: Authenticated endpoint (GET /jobs) ────────────────────────────
+      # Step 2a: get a Cognito access token for the smoke test user.
+      # InitiateAuth with USER_PASSWORD_AUTH flow. The access token is used
+      # as the Bearer token for the API call.
+      #
+      # IMPORTANT: the token is stored in a variable and passed via --data.
+      # It is never echoed to the log with `echo`. The response body is written
+      # to a temp file; the only thing we print is the HTTP status and a
+      # redacted token prefix.
+      - echo "=== Test 2: Authenticated endpoint ==="
+      - echo "  Obtaining Cognito access token..."
+      - |
+        AUTH_RESPONSE=$(aws cognito-idp initiate-auth \
+          --auth-flow USER_PASSWORD_AUTH \
+          --client-id "$COGNITO_CLIENT_ID" \
+          --auth-parameters USERNAME="$SMOKE_USERNAME",PASSWORD="$SMOKE_PASSWORD" \
+          --region "$AWS_DEFAULT_REGION" \
+          --output json 2>/tmp/auth_error.json)
+        if [ $? -ne 0 ]; then
+          echo "FAIL: Cognito authentication failed."
+          echo "Error: $(cat /tmp/auth_error.json)"
+          exit 1
+        fi
+        ACCESS_TOKEN=$(echo "$AUTH_RESPONSE" | python3 -c "
+        import sys, json
+        r = json.load(sys.stdin)
+        print(r['AuthenticationResult']['AccessToken'])
+        ")
+        echo "  Token obtained (prefix: ${ACCESS_TOKEN:0:10}...)."
+
+      # Step 2b: call GET /jobs with the access token.
+      # Expected: HTTP 200 with {"jobs": [...], "total": N}
+      - |
+        HTTP_STATUS=$(curl -s -o /tmp/jobs_response.json -w "%{http_code}" \
+          -H "Authorization: Bearer $ACCESS_TOKEN" \
+          "$API_URL/jobs")
+        echo "  Status: $HTTP_STATUS"
+        if [ "$HTTP_STATUS" != "200" ]; then
+          echo "FAIL: GET /jobs returned $HTTP_STATUS (expected 200)"
+          echo "Body: $(cat /tmp/jobs_response.json)"
+          exit 1
+        fi
+        # Validate the response shape has "jobs" and "total" fields.
+        python3 -c "
+        import json, sys
+        r = json.load(open('/tmp/jobs_response.json'))
+        assert 'jobs' in r, f'Missing jobs field: {r}'
+        assert 'total' in r, f'Missing total field: {r}'
+        print(f'  Response shape valid. total={r[\"total\"]} jobs.')
+        "
+      - echo "  PASS: GET /jobs returned 200 with valid response shape."
+
+      # ── Test 3: Frontend ──────────────────────────────────────────────────────
+      # Fetch the root URL from CloudFront. Expect HTTP 200 and an HTML body
+      # containing "CSVForge" (the app title in index.html).
+      # This confirms: S3 sync succeeded, CloudFront is serving the new version,
+      # and the OAC configuration is working.
+      - echo "=== Test 3: Frontend (CloudFront) ==="
+      - |
+        HTTP_STATUS=$(curl -s -o /tmp/frontend_response.html -w "%{http_code}" "$CLOUDFRONT_URL/")
+        echo "  Status: $HTTP_STATUS"
+        if [ "$HTTP_STATUS" != "200" ]; then
+          echo "FAIL: CloudFront root returned $HTTP_STATUS (expected 200)"
+          echo "Body preview: $(head -5 /tmp/frontend_response.html)"
+          exit 1
+        fi
+        # Verify the HTML contains the app title — confirms the correct index.html
+        # was deployed (not an S3 error page or old version).
+        if ! grep -q "CSVForge" /tmp/frontend_response.html; then
+          echo "FAIL: Frontend HTML does not contain 'CSVForge'"
+          echo "Body preview: $(head -10 /tmp/frontend_response.html)"
+          exit 1
+        fi
+      - echo "  PASS: CloudFront returned 200 with CSVForge HTML."
+
+      # ── Summary ───────────────────────────────────────────────────────────────
+      - |
+        echo ""
+        echo "======================================"
+        echo "  ALL SMOKE TESTS PASSED"
+        echo "  API:      $API_URL"
+        echo "  Frontend: $CLOUDFRONT_URL"
+        echo "  Commit:   $CODEBUILD_RESOLVED_SOURCE_VERSION"
+        echo "======================================"
+
+  post_build:
+    commands:
+      - echo "Smoke test stage complete."

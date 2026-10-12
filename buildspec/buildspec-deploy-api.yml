@@ -1,0 +1,148 @@
+# buildspec-deploy-api.yml
+#
+# WHAT:
+#   Deploys the packaged API Lambda ZIP to the csvforge-api-dev Lambda function.
+#   Runs in Stage 4 of the pipeline, after build artifacts are produced.
+#
+# WHAT THIS BUILD DOES:
+#   1. Reads the artifact metadata from S3 to find the exact ZIP key.
+#   2. Updates the Lambda function code (points Lambda at the new ZIP in S3).
+#   3. Waits for the update to complete (Lambda state: Successful).
+#   4. Updates environment variables if they've changed (optional).
+#   5. Publishes a Lambda version and records it (for audit and rollback reference).
+#
+# DEPLOY FLOW:
+#   buildspec-build-api.yml wrote:
+#     s3://csvforge-pipeline-artifacts-dev/api/csvforge-api-{sha}.zip  ← the code
+#     s3://csvforge-pipeline-artifacts-dev/api/latest-meta.json        ← pointer
+#
+#   This buildspec reads latest-meta.json to find the SHA, then calls:
+#     aws lambda update-function-code \
+#       --s3-bucket csvforge-pipeline-artifacts-dev \
+#       --s3-key api/csvforge-api-{sha}.zip
+#
+# WHY TWO SEPARATE API CALLS (update-function-code then wait):
+#   Lambda transitions through InProgress → Successful after update-function-code.
+#   If you call update-function-configuration while the previous update is
+#   InProgress, Lambda returns ResourceConflictException. The `wait function-updated`
+#   command polls every 5 seconds until the state becomes Successful (or Failed).
+#   Without this wait, the pipeline races and may leave the Lambda in a broken state.
+#
+# ROLLBACK:
+#   Previous ZIPs remain in S3 with their git SHA key. To roll back:
+#     aws lambda update-function-code \
+#       --function-name csvforge-api-dev \
+#       --s3-bucket csvforge-pipeline-artifacts-dev \
+#       --s3-key api/csvforge-api-{previous-sha}.zip
+#   No rebuild required. See docs/CI_CD_RUNBOOK.md for the rollback procedure.
+#
+# IAM PERMISSIONS NEEDED:
+#   lambda:UpdateFunctionCode, lambda:UpdateFunctionConfiguration,
+#   lambda:GetFunctionConfiguration, lambda:PublishVersion
+#   s3:GetObject on csvforge-pipeline-artifacts-dev/api/*
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-south-1"
+    FUNCTION_NAME: "csvforge-api-dev"
+    ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
+
+phases:
+  pre_build:
+    commands:
+      # ── Step 1: Read artifact metadata ──────────────────────────────────────
+      # The build stage wrote a JSON file pointing to the exact ZIP to deploy.
+      # We read it here rather than recomputing the git SHA, which ensures
+      # we deploy exactly the artifact that was built and tested — not a new
+      # build from a potentially different source revision.
+      - echo "Reading artifact metadata..."
+      - aws s3 cp "s3://$ARTIFACT_BUCKET/api/latest-meta.json" /tmp/api-meta.json
+      - cat /tmp/api-meta.json
+      - export GIT_SHA=$(python3 -c "import json; d=json.load(open('/tmp/api-meta.json')); print(d['git_sha'])")
+      - export ZIP_KEY=$(python3 -c "import json; d=json.load(open('/tmp/api-meta.json')); print(d['zip_key'])")
+      - echo "Deploying commit $GIT_SHA from s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+
+      # ── Verify the artifact exists before attempting deploy ──────────────────
+      # If the ZIP doesn't exist in S3 (build stage failure, wrong key), the deploy
+      # will fail with a confusing S3 error. This explicit check gives a clear message.
+      - |
+        if ! aws s3 ls "s3://$ARTIFACT_BUCKET/$ZIP_KEY" > /dev/null 2>&1; then
+          echo "ERROR: Artifact not found: s3://$ARTIFACT_BUCKET/$ZIP_KEY"
+          echo "Did the build stage complete successfully?"
+          exit 1
+        fi
+      - echo "Artifact verified."
+
+  build:
+    commands:
+      # ── Step 2: Update Lambda function code ─────────────────────────────────
+      # This replaces the ZIP that Lambda will use for new invocations.
+      # In-flight invocations (currently running) complete with the OLD code.
+      # New invocations after this call completes use the NEW code.
+      # The update is NOT instantaneous — Lambda transitions through InProgress.
+      - echo "Updating Lambda function code..."
+      - |
+        aws lambda update-function-code \
+          --function-name "$FUNCTION_NAME" \
+          --s3-bucket "$ARTIFACT_BUCKET" \
+          --s3-key "$ZIP_KEY" \
+          --region "$AWS_DEFAULT_REGION" \
+          --output json | python3 -c "
+        import sys, json
+        r = json.load(sys.stdin)
+        print(f'  Function ARN: {r[\"FunctionArn\"]}')
+        print(f'  State:        {r[\"State\"]}')
+        print(f'  Last update:  {r.get(\"LastUpdateStatus\", \"unknown\")}')
+        "
+
+      # ── Step 3: Wait for the update to complete ──────────────────────────────
+      # This is mandatory before making any subsequent Lambda API calls.
+      # `wait function-updated` polls every 5 seconds, up to 60 polls (5 minutes).
+      # If the Lambda is still InProgress after 5 minutes, the wait fails and
+      # the pipeline fails — which is correct; something is wrong with the Lambda.
+      - echo "Waiting for function update to complete..."
+      - aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$AWS_DEFAULT_REGION"
+      - echo "Lambda update complete."
+
+      # ── Step 4: Verify the deployed code ────────────────────────────────────
+      # Confirm the function is in Active state and print the code SHA256.
+      # Lambda computes the SHA256 of the ZIP and stores it in CodeSha256.
+      # Comparing this to the artifact helps detect silent corruption.
+      - |
+        aws lambda get-function-configuration \
+          --function-name "$FUNCTION_NAME" \
+          --region "$AWS_DEFAULT_REGION" \
+          --output json | python3 -c "
+        import sys, json
+        r = json.load(sys.stdin)
+        print(f'  State:              {r[\"State\"]}')
+        print(f'  LastUpdateStatus:   {r.get(\"LastUpdateStatus\", \"n/a\")}')
+        print(f'  Runtime:            {r[\"Runtime\"]}')
+        print(f'  CodeSha256:         {r[\"CodeSha256\"]}')
+        print(f'  FunctionArn:        {r[\"FunctionArn\"]}')
+        "
+
+      # ── Step 5: Record the deployed version ─────────────────────────────────
+      # Write a deployment record to S3 for audit purposes.
+      # This lets you answer: "what commit is currently deployed?"
+      # without going to the Lambda console.
+      - |
+        cat > /tmp/api-deploy-record.json << EOF
+        {
+          "function_name": "$FUNCTION_NAME",
+          "git_sha": "$GIT_SHA",
+          "zip_key": "$ZIP_KEY",
+          "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "pipeline_execution": "$CODEPIPELINE_EXECUTION_ID"
+        }
+        EOF
+      - aws s3 cp /tmp/api-deploy-record.json "s3://$ARTIFACT_BUCKET/deployments/api/current.json"
+      - echo "Deployment record saved."
+
+  post_build:
+    commands:
+      - echo "API Lambda deploy complete."
+      - echo "Function: $FUNCTION_NAME"
+      - echo "Source:   $CODEBUILD_RESOLVED_SOURCE_VERSION"

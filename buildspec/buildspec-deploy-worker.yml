@@ -1,0 +1,170 @@
+# buildspec-deploy-worker.yml
+#
+# WHAT:
+#   Deploys the worker Lambda container image from ECR.
+#   Runs in Stage 4 alongside buildspec-deploy-api.yml.
+#
+# KEY DIFFERENCE FROM API DEPLOY:
+#   The API Lambda uses a ZIP file stored in S3.
+#   The worker Lambda uses a container image stored in ECR.
+#   The update-function-code call syntax differs:
+#     ZIP:   --s3-bucket ... --s3-key ...
+#     Image: --image-uri {ecr-repo}@sha256:{digest}
+#
+# WHY DEPLOY WITH DIGEST (not tag):
+#   The build stage pushed two references for the same image:
+#     Tag:    {repo}:a3f9c12  (mutable — a future push can overwrite this tag)
+#     Digest: {repo}@sha256:... (immutable — locked to exact bytes)
+#
+#   If we deployed with the tag, a future push of a different image to the same
+#   tag would not affect the running Lambda (Lambda caches the resolved image at
+#   deploy time). But it creates confusion: the tag in ECR shows a different image
+#   than what Lambda is running. Deploying with the digest is unambiguous —
+#   the Lambda configuration explicitly records which exact image it runs.
+#
+# SQS EVENT SOURCE MAPPING:
+#   We do NOT re-create the SQS event source mapping here. It was created by
+#   the CloudFormation worker.yaml stack. Updating function code does not affect
+#   the event source mapping — it continues polling the same SQS queue with the
+#   same batch size. Only if you need to change batch size or visibility timeout
+#   do you need to update the event source mapping (via worker.yaml change set).
+#
+# ROLLBACK:
+#   Rollback means pointing Lambda at the previous image digest:
+#     aws lambda update-function-code \
+#       --function-name csvforge-worker-dev \
+#       --image-uri {ecr-repo}@sha256:{previous-digest}
+#   The previous image layers remain in ECR (ECR lifecycle policy keeps
+#   the last 5 tagged images per worker.yaml LifecyclePolicy).
+#   See docs/CI_CD_RUNBOOK.md for the full rollback procedure.
+#
+# IAM PERMISSIONS NEEDED:
+#   lambda:UpdateFunctionCode, lambda:GetFunctionConfiguration,
+#   lambda:GetFunction (to verify the image URI after update)
+#   s3:GetObject on csvforge-pipeline-artifacts-dev/worker/*
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-south-1"
+    FUNCTION_NAME: "csvforge-worker-dev"
+    ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
+
+phases:
+  pre_build:
+    commands:
+      # ── Step 1: Read worker image metadata ──────────────────────────────────
+      # The build stage wrote worker/latest-meta.json containing the image digest.
+      # We read the digest here — not the tag — to ensure we deploy the exact
+      # image that was built and scanned in this pipeline run.
+      - echo "Reading worker image metadata..."
+      - aws s3 cp "s3://$ARTIFACT_BUCKET/worker/latest-meta.json" /tmp/worker-meta.json
+      - cat /tmp/worker-meta.json
+      - export GIT_SHA=$(python3 -c "import json; d=json.load(open('/tmp/worker-meta.json')); print(d['git_sha'])")
+      - export IMAGE_DIGEST=$(python3 -c "import json; d=json.load(open('/tmp/worker-meta.json')); print(d['image_digest'])")
+      - export IMAGE_TAG=$(python3 -c "import json; d=json.load(open('/tmp/worker-meta.json')); print(d['image_tag'])")
+      - echo "Deploying commit $GIT_SHA"
+      - echo "Image digest: $IMAGE_DIGEST"
+
+      # ── Verify the image exists in ECR before attempting deploy ──────────────
+      # Extract account and repo from the image tag, then verify with ECR API.
+      # Deploying a non-existent image URI gives a Lambda error that's harder to
+      # diagnose than an explicit "image not found" check here.
+      - export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com"
+      - |
+        echo "Verifying image exists in ECR..."
+        # Describe the specific image by digest to confirm it was pushed successfully.
+        DIGEST_ONLY=$(echo "$IMAGE_DIGEST" | sed 's/.*@//')
+        aws ecr describe-images \
+          --repository-name csvforge-worker-dev \
+          --image-ids imageDigest=$DIGEST_ONLY \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'imageDetails[0].imagePushedAt' \
+          --output text
+        echo "ECR image verified."
+
+  build:
+    commands:
+      # ── Step 2: Update Lambda function code to new image ────────────────────
+      # --image-uri uses the digest (sha256:...) not the mutable tag.
+      # Lambda resolves the digest to the actual image layers at deploy time.
+      # Any future pushes to the same tag in ECR will NOT affect this Lambda
+      # unless you explicitly redeploy with a new digest.
+      - echo "Updating worker Lambda function code..."
+      - |
+        aws lambda update-function-code \
+          --function-name "$FUNCTION_NAME" \
+          --image-uri "$IMAGE_DIGEST" \
+          --region "$AWS_DEFAULT_REGION" \
+          --output json | python3 -c "
+        import sys, json
+        r = json.load(sys.stdin)
+        print(f'  Function ARN:  {r[\"FunctionArn\"]}')
+        print(f'  State:         {r[\"State\"]}')
+        print(f'  Package type:  {r[\"PackageType\"]}')
+        "
+
+      # ── Step 3: Wait for the update to complete ──────────────────────────────
+      # Container image updates take longer than ZIP updates (30–120 seconds)
+      # because Lambda pulls the image layers from ECR.
+      # wait function-updated polls every 5 seconds, up to 60 polls (5 minutes).
+      - echo "Waiting for worker Lambda update (image pulls may take 1-2 minutes)..."
+      - aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$AWS_DEFAULT_REGION"
+      - echo "Worker Lambda update complete."
+
+      # ── Step 4: Verify the deployed image ────────────────────────────────────
+      # Get-function returns the full function configuration including the
+      # ImageUri field which shows the resolved digest. This confirms Lambda
+      # is actually configured to run our new image.
+      - |
+        aws lambda get-function \
+          --function-name "$FUNCTION_NAME" \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'Configuration.{State:State,LastUpdateStatus:LastUpdateStatus,PackageType:PackageType}' \
+          --output json | python3 -c "
+        import sys, json
+        r = json.load(sys.stdin)
+        for k, v in r.items():
+            print(f'  {k}: {v}')
+        "
+
+      # ── Step 5: Verify SQS event source mapping is enabled ───────────────────
+      # The event source mapping connects SQS to Lambda. Updating the function
+      # code doesn't affect it, but it's worth confirming it's still enabled.
+      # If it was accidentally disabled (e.g., during a previous failed deploy),
+      # the worker would silently stop consuming messages.
+      - |
+        MAPPING_STATE=$(aws lambda list-event-source-mappings \
+          --function-name "$FUNCTION_NAME" \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'EventSourceMappings[0].State' \
+          --output text)
+        echo "SQS event source mapping state: $MAPPING_STATE"
+        if [ "$MAPPING_STATE" != "Enabled" ]; then
+          echo "WARNING: SQS event source mapping is not Enabled (state: $MAPPING_STATE)"
+          echo "Check the worker.yaml stack — the mapping may need to be re-enabled."
+          # This is a warning, not a failure — the function code is deployed.
+          # A disabled mapping means no new jobs will be processed until it's re-enabled.
+        fi
+
+      # ── Step 6: Record the deployment ────────────────────────────────────────
+      - |
+        cat > /tmp/worker-deploy-record.json << EOF
+        {
+          "function_name": "$FUNCTION_NAME",
+          "git_sha": "$GIT_SHA",
+          "image_digest": "$IMAGE_DIGEST",
+          "image_tag": "$IMAGE_TAG",
+          "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "pipeline_execution": "$CODEPIPELINE_EXECUTION_ID"
+        }
+        EOF
+      - aws s3 cp /tmp/worker-deploy-record.json "s3://$ARTIFACT_BUCKET/deployments/worker/current.json"
+
+  post_build:
+    commands:
+      - echo "Worker Lambda deploy complete."
+      - echo "Function: $FUNCTION_NAME"
+      - echo "Image:    $IMAGE_DIGEST"

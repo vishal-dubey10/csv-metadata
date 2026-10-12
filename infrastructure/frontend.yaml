@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge Frontend — Private S3 bucket + CloudFront distribution with OAC.
+
+  WHAT THIS TEMPLATE DOES:
+    Creates the infrastructure for hosting the React single-page application:
+      1. Private S3 bucket — stores the built frontend assets (HTML, JS, CSS).
+      2. CloudFront Origin Access Control (OAC) — allows CloudFront to read
+         from the private S3 bucket without making the bucket public.
+      3. CloudFront distribution — CDN that serves the app over HTTPS from
+         edge locations worldwide.
+      4. S3 bucket policy — grants only the CloudFront distribution read access.
+
+  WHY CLOUDFRONT + PRIVATE S3 (not S3 static website hosting):
+    S3 static website hosting serves over HTTP only, from a single region.
+    CloudFront provides: HTTPS (required for Cognito tokens in localStorage),
+    global edge caching (faster page loads), DDoS protection at the CDN layer,
+    and custom error responses (needed for SPA routing — see below).
+
+  SPA ROUTING AND 404 HANDLING:
+    React Router uses browser history routing (e.g., /jobs/abc123).
+    When a user navigates directly to /jobs/abc123, their browser asks CloudFront
+    for the S3 object at that path — which doesn't exist (the object is index.html
+    at the root). S3 returns 404. Without custom error handling, the user sees a 404.
+    The fix: a CloudFront custom error response that maps 404 → 200 with index.html.
+    React Router then handles the /jobs/abc123 path client-side.
+    We also map 403 → index.html because S3 returns 403 (not 404) for missing
+    objects in a private bucket.
+
+  ORIGIN ACCESS CONTROL (OAC) vs ORIGIN ACCESS IDENTITY (OAI):
+    OAI is the older mechanism — it creates a special CloudFront user that S3 allows.
+    OAC is the current AWS recommendation — it uses SigV4 signing at the CloudFront
+    level, supports more S3 features (including SSE-KMS), and doesn't require managing
+    a separate IAM principal. Use OAC for all new distributions.
+
+  CACHING STRATEGY:
+    index.html:   Cache-Control: no-cache (always fetch fresh — it changes on deploy)
+    assets/*:     Cache-Control: max-age=31536000, immutable (cache forever — content-hashed)
+    This is handled by the S3 sync command in buildspec-deploy-frontend.yml,
+    not by CloudFront cache behaviors, for simplicity.
+
+  COST:
+    CloudFront: first 1TB/month + 10M requests free (12 months).
+      After free tier: ~$0.0085/GB + $0.0075/10K HTTPS requests.
+      For dev usage: negligible (< $1/month).
+    S3 standard storage: $0.023/GB/month.
+      A typical React build is ~2-5MB: < $0.01/month.
+    CloudFront invalidations: first 1,000 paths/month free.
+      One `/*` wildcard = one path. Dev usage stays in free tier.
+
+  HOW TO DEPLOY:
+    aws cloudformation deploy \
+      --template-file infrastructure/frontend.yaml \
+      --stack-name csvforge-frontend-dev \
+      --region ap-south-1
+
+  AFTER DEPLOY:
+    Get the CloudFront URL:
+      aws cloudformation describe-stacks \
+        --stack-name csvforge-frontend-dev \
+        --query "Stacks[0].Outputs[?OutputKey=='CloudFrontURL'].OutputValue" \
+        --output text
+    Add this URL to ALLOWED_ORIGINS in the API Lambda's environment variables.
+    Add the CloudFront distribution ID to SSM Parameter Store for the deploy buildspec.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+
+  # ── Frontend S3 Bucket ─────────────────────────────────────────────────────
+  # Private bucket — only CloudFront can read from it (via OAC + bucket policy).
+  # Direct S3 URLs return 403 to all callers, including authenticated IAM users
+  # unless explicitly granted (we don't grant them — all access goes via CloudFront).
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "csvforge-frontend-${Environment}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Suspended   # Versioning not needed for static assets (content-hashed)
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldAssets
+            Status: Enabled
+            # Delete objects not touched in 90 days.
+            # Old hashed assets accumulate after each deploy — this cleans them up.
+            # index.html is always overwritten on each deploy (no hash in its name).
+            # Old asset files (e.g., main-a3f9c12.js) are only referenced by
+            # their matching index.html; after two or three deploys they're unreachable.
+            ExpirationInDays: 90
+
+  # ── CloudFront Origin Access Control ──────────────────────────────────────
+  # OAC allows CloudFront to sign requests to S3 using SigV4.
+  # The S3 bucket policy (below) grants s3:GetObject only when the request
+  # comes from this CloudFront distribution (identified by the distribution ARN
+  # in the aws:SourceArn condition).
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "csvforge-frontend-oac-${Environment}"
+        Description: OAC for private S3 origin — csvforge frontend
+        # S3 is the origin type; this enables S3-specific SigV4 signing.
+        OriginAccessControlOriginType: s3
+        # "always" means CloudFront always signs requests to the origin,
+        # even if the request comes from a non-CloudFront source.
+        # "no-override" is the alternative (only sign if origin requires it).
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── CloudFront Distribution ────────────────────────────────────────────────
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "CSVForge frontend — ${Environment}"
+        Enabled: true
+        # IPv6 support: enable for compatibility with modern clients.
+        # CloudFront assigns both an IPv4 and IPv6 address to the distribution.
+        IPV6Enabled: true
+        # index.html is the default root object.
+        # When a user visits the CloudFront URL without a path (/), CloudFront
+        # serves index.html from S3. Without this, / returns an XML S3 error.
+        DefaultRootObject: index.html
+
+        # ── Origin (S3 bucket) ───────────────────────────────────────────────
+        Origins:
+          - Id: S3FrontendOrigin
+            # DomainName must be the S3 regional endpoint (not the website endpoint).
+            # The regional endpoint supports OAC; the website endpoint doesn't.
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              # Empty OriginAccessIdentity = use OAC instead of OAI.
+              # If you set an OAI here AND reference OAC, CloudFormation will reject it.
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref FrontendOAC
+
+        # ── Default cache behavior ────────────────────────────────────────────
+        # Applies to all paths (*). The buildspec sets Cache-Control headers on
+        # S3 objects directly during sync — CloudFront respects the S3 object's
+        # Cache-Control header by default.
+        DefaultCacheBehavior:
+          TargetOriginId: S3FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          # CachingOptimized managed policy: 24-hour TTL with compression.
+          # This is the AWS-recommended policy for S3 origins.
+          # Cache-Control headers on individual S3 objects override this TTL.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # Compress: gzip/brotli compress responses at the edge.
+          # Reduces transfer size by 60-80% for text assets (HTML, JS, CSS).
+          Compress: true
+          # AllowedMethods: GET and HEAD only — no writes through CloudFront.
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+
+        # ── Custom error responses (SPA routing) ─────────────────────────────
+        # When React Router navigates to /jobs/abc123, the S3 object doesn't exist.
+        # S3 returns 403 (private bucket) or 404 (explicit key not found).
+        # CloudFront catches these, returns index.html with HTTP 200.
+        # React Router reads window.location.pathname and routes client-side.
+        #
+        # WHY 403 AND 404 (not just 404):
+        #   A private S3 bucket returns 403 Forbidden for any key that doesn't
+        #   exist (not 404 — S3 won't confirm whether a key exists when the bucket
+        #   is private). So we map both to index.html.
+        #
+        # ResponsePagePath: the path to index.html in S3, served from CloudFront.
+        # ResponseCode: 200 — the browser sees HTTP 200 even though S3 returned 404/403.
+        #   Using 404 here would confuse search engine crawlers and browser history.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0   # Don't cache error responses
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+        # ── Price class ───────────────────────────────────────────────────────
+        # PriceClass_100: edge locations in US, EU, and Asia Pacific only.
+        # For a dev project targeting ap-south-1, this is sufficient and cheaper
+        # than PriceClass_All (which includes South America, Australia, etc.)
+        PriceClass: PriceClass_100
+
+  # ── S3 Bucket Policy ───────────────────────────────────────────────────────
+  # Grants CloudFront (via OAC) read access to S3 objects.
+  # The aws:SourceArn condition scopes access to this specific distribution —
+  # other CloudFront distributions (including attacker-controlled ones) cannot
+  # read from this bucket.
+  #
+  # WHY Fn::Sub WITH AWS::PARTITION:
+  #   The ARN format is: arn:{partition}:cloudfront::{account}:distribution/{id}
+  #   Using AWS::Partition instead of hardcoding "aws" ensures the policy works
+  #   in AWS GovCloud (aws-us-gov) and China (aws-cn) regions.
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+Outputs:
+  CloudFrontURL:
+    Description: >
+      HTTPS URL for the deployed frontend.
+      Add to ALLOWED_ORIGINS env var on the API Lambda.
+      Add to VITE_API_URL in SSM Parameter Store for the frontend build.
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontURL"
+
+  CloudFrontDistributionId:
+    Description: >
+      CloudFront distribution ID. Used in the deploy buildspec for invalidations:
+        aws cloudfront create-invalidation \
+          --distribution-id <this value> \
+          --paths "/*"
+      Store this in SSM Parameter Store at /csvforge/dev/cloudfront-distribution-id
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-DistributionId"
+
+  FrontendBucketName:
+    Description: >
+      S3 bucket name for frontend assets.
+      Store in SSM at /csvforge/dev/frontend-bucket-name for the deploy buildspec.
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"

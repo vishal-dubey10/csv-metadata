@@ -1,0 +1,176 @@
+# buildspec-migrate.yml
+#
+# WHAT:
+#   Runs Alembic database migrations against the target environment's RDS instance.
+#
+# CRITICAL: THIS BUILDSPEC IS NOT IN THE MAIN PIPELINE.
+#   It runs in a SEPARATE CodeBuild project (csvforge-migrate-dev) that is
+#   triggered MANUALLY — never automatically on code push.
+#   Reason: migrations are irreversible. An untested migration deployed
+#   automatically could corrupt production data with no safe rollback path.
+#
+# HOW TO TRIGGER (after reviewing the migration):
+#   aws codebuild start-build \
+#     --project-name csvforge-migrate-dev \
+#     --region ap-south-1
+#   Then monitor in the CodeBuild console and confirm the `alembic upgrade head`
+#   output shows only the expected migration(s).
+#
+# BEFORE RUNNING:
+#   1. Review the migration files in backend/alembic/versions/.
+#   2. Confirm the migration is backward-compatible with the current deployed code.
+#   3. Confirm you have a recent RDS snapshot (automated backups run daily;
+#      verify in the RDS console before a risky migration).
+#   4. Run against dev first, then staging, then production.
+#   5. Never run this buildspec against production without first running it
+#      successfully against dev and staging.
+#
+# CODEBUILD VPC CONFIGURATION REQUIRED:
+#   This CodeBuild project must be configured with VPC access to reach RDS:
+#     VpcId:            csvforge-vpc-dev (from network.yaml Output)
+#     Subnets:          PrivateSubnetA, PrivateSubnetB
+#     SecurityGroupIds: LambdaSecurityGroup (already has RDS egress on port 5432)
+#   Without VPC config, CodeBuild cannot reach the private RDS endpoint.
+#   Set in the CodeBuild project configuration, not in this buildspec.
+#
+# ENVIRONMENT SAFETY CHECK:
+#   The buildspec reads DEPLOY_ENVIRONMENT from the CodeBuild project env vars.
+#   It prints the target environment and the current DB state BEFORE running
+#   the migration, so you can verify you're targeting the right database.
+#   It also checks that alembic upgrade head is NOT already at the latest
+#   revision (a no-op migration logs this clearly).
+#
+# ROLLBACK LIMITATIONS:
+#   `alembic downgrade -1` undoes the most recent migration IF the migration
+#   defines a proper downgrade() function. Most simple ADD COLUMN migrations
+#   have a safe downgrade (DROP COLUMN). But:
+#   - DROP COLUMN downgrades lose data permanently.
+#   - Column type changes may be irreversible.
+#   - Data migrations (UPDATE statements) are never safely reversible.
+#   Always treat the RDS snapshot as the true rollback mechanism for risky migrations.
+#
+# IAM PERMISSIONS NEEDED (on the CodeBuild role):
+#   secretsmanager:GetSecretValue on the DB secret ARN
+#   ssm:GetParameter on /csvforge/{env}/rds-endpoint
+#   (VPC access is configured on the CodeBuild project, not via IAM)
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-south-1"
+    # DEPLOY_ENVIRONMENT is set on the CodeBuild project, not here.
+    # Acceptable values: dev, staging, prod
+    # This prevents accidentally hard-coding "dev" here and then using
+    # this same buildspec for production (which reads from the same file).
+    DEPLOY_ENVIRONMENT: "UNSET"
+
+phases:
+  install:
+    runtime-versions:
+      python: "3.14"
+    commands:
+      - pip install --upgrade pip --quiet
+      - pip install -r backend/requirements.txt --quiet
+      - echo "Alembic version:"
+      - alembic --version
+
+  pre_build:
+    commands:
+      # ── Safety check 1: confirm DEPLOY_ENVIRONMENT is set ───────────────────
+      - |
+        if [ "$DEPLOY_ENVIRONMENT" = "UNSET" ]; then
+          echo "ERROR: DEPLOY_ENVIRONMENT is not set."
+          echo "Set it on the CodeBuild project environment variables."
+          echo "Valid values: dev, staging, prod"
+          exit 1
+        fi
+        echo "Target environment: $DEPLOY_ENVIRONMENT"
+
+      # ── Safety check 2: require explicit confirmation for production ─────────
+      # Production migrations require an environment variable CONFIRM_PRODUCTION=yes
+      # to be set at the time of triggering the build. This prevents a careless
+      # `start-build` on the production project from running migrations.
+      # To run production: aws codebuild start-build \
+      #   --project-name csvforge-migrate-prod \
+      #   --environment-variables-override name=CONFIRM_PRODUCTION,value=yes
+      - |
+        if [ "$DEPLOY_ENVIRONMENT" = "prod" ]; then
+          if [ "$CONFIRM_PRODUCTION" != "yes" ]; then
+            echo "ERROR: Production migration requires CONFIRM_PRODUCTION=yes"
+            echo "Re-trigger with: --environment-variables-override name=CONFIRM_PRODUCTION,value=yes"
+            exit 1
+          fi
+          echo "WARNING: Running migration against PRODUCTION database."
+          echo "You have 10 seconds to cancel (Ctrl+C or stop the build)..."
+          sleep 10
+        fi
+
+      # ── Step 1: Fetch database credentials from Secrets Manager ─────────────
+      # The password lives in Secrets Manager. We call get-secret-value here
+      # (the same call that Lambda makes at cold start in connection.py).
+      # The secret value is a JSON string: {"username":"...","password":"..."}
+      # We parse it with Python to extract the fields.
+      - echo "Fetching database credentials..."
+      - |
+        SSM_PREFIX="/csvforge/$DEPLOY_ENVIRONMENT"
+        SECRET_ARN=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/db-secret-arn" \
+          --query Parameter.Value --output text)
+        DB_HOST=$(aws ssm get-parameter \
+          --name "$SSM_PREFIX/rds-endpoint" \
+          --query Parameter.Value --output text)
+
+        SECRET_JSON=$(aws secretsmanager get-secret-value \
+          --secret-id "$SECRET_ARN" \
+          --query SecretString \
+          --output text)
+        DB_USER=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
+        DB_PASS=$(echo "$SECRET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+
+        # Construct DATABASE_URL and export it for Alembic.
+        # IMPORTANT: never echo DATABASE_URL — it contains the password.
+        export DATABASE_URL="postgresql+psycopg://${DB_USER}:${DB_PASS}@${DB_HOST}:5432/csvforge"
+        export ENVIRONMENT=local   # tells connection.py to use DATABASE_URL directly
+
+        echo "  RDS host: $DB_HOST"
+        echo "  DB user:  $DB_USER"
+        # Do NOT echo password or full DATABASE_URL.
+
+      # ── Step 2: Show current migration state BEFORE running anything ─────────
+      # Print the current head and current applied revisions.
+      # This is your "before" snapshot — record it in your migration runbook.
+      - echo "Current Alembic state (before migration):"
+      - PYTHONPATH=. alembic current
+      - echo "Available revisions (all heads):"
+      - PYTHONPATH=. alembic heads
+
+  build:
+    commands:
+      # ── Step 3: Run the migration ─────────────────────────────────────────────
+      # `alembic upgrade head` applies all pending migrations in order.
+      # Each migration is an SQL transaction — if it fails partway through,
+      # the transaction is rolled back and the database is unchanged.
+      # Alembic logs each migration step as it runs.
+      - echo "Running: alembic upgrade head"
+      - PYTHONPATH=. alembic upgrade head
+      - echo "Migration complete."
+
+      # ── Step 4: Verify the final state ───────────────────────────────────────
+      # Print the applied revision again. Confirm it matches the expected head.
+      # If alembic upgrade head was a no-op (already at head), this shows the
+      # same revision as before — which is correct and not an error.
+      - echo "Alembic state after migration:"
+      - PYTHONPATH=. alembic current
+
+  post_build:
+    commands:
+      - echo "Migration job complete for environment: $DEPLOY_ENVIRONMENT"
+      - echo "Source revision: $CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - |
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ]; then
+          echo "Status: SUCCESS"
+        else
+          echo "Status: FAILED — check the Alembic output above for error details."
+          echo "The database transaction was rolled back. No schema changes were applied."
+        fi

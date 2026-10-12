@@ -1,0 +1,679 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CSVForge CI/CD Pipeline — CodePipeline orchestrating all build, test, and deploy stages.
+
+  WHAT THIS TEMPLATE CREATES:
+    1.  CodePipeline (csvforge-pipeline-dev) with 6 stages.
+    2.  IAM roles for CodePipeline and each CodeBuild project.
+    3.  CodeBuild projects for: backend tests, frontend tests, API build,
+        worker build, API deploy, worker deploy, frontend deploy, smoke tests.
+    4.  SNS topic for pipeline failure notifications.
+
+  STAGE ORDER:
+    Stage 1 — Source:     CodeConnections fetches repo at the triggering commit.
+    Stage 2 — Test:       Backend tests + cfn-lint + frontend tests (parallel).
+    Stage 3 — Build:      API ZIP + worker Docker image + frontend build (parallel).
+    Stage 4 — Deploy:     API Lambda + worker Lambda + frontend S3 (parallel).
+    Stage 5 — Verify:     Smoke tests (sequential — runs after all deploys complete).
+    Stage 6 — Infra Gate: Manual approval → CloudFormation change-set apply.
+
+  DEPLOY THIS STACK AFTER:
+    csvforge-pipeline-bootstrap-dev  (artifact bucket + GitHub connection)
+    csvforge-network-dev             (VPC exports used by migrate CodeBuild)
+    csvforge-data-dev                (S3 bucket deployed)
+    csvforge-queues-dev              (SQS deployed)
+    csvforge-api-dev                 (Cognito + API Gateway deployed)
+    csvforge-worker-dev              (ECR + worker Lambda deployed)
+    csvforge-frontend-dev            (frontend S3 + CloudFront deployed)
+
+  COST:
+    CodePipeline: $1/active pipeline/month. One pipeline = $1/month.
+    CodeBuild: first 100 build minutes/month free. After free tier:
+      general1.small = $0.005/build-minute.
+      Typical run: ~8 minutes build time = $0.04/pipeline run.
+      At 50 runs/month = $2/month + $1 pipeline = ~$3/month.
+
+Parameters:
+  GitHubConnectionArn:
+    Type: String
+    Description: >
+      ARN of the GitHub connection from csvforge-pipeline-bootstrap-dev.
+      Must be in AVAILABLE state (approved in Console) before pipeline runs.
+
+  GitHubOwner:
+    Type: String
+    Description: GitHub username or organization that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: csv-metadata
+    Description: GitHub repository name.
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch to monitor for pipeline triggers.
+
+  ArtifactBucketName:
+    Type: String
+    Default: csvforge-pipeline-artifacts-dev
+    Description: S3 bucket for pipeline artifacts (from bootstrap stack).
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for pipeline failure notifications.
+
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+
+  # ── SNS Topic for pipeline notifications ─────────────────────────────────
+  # Sends email on pipeline failure. Subscribe the ops team here so failures
+  # are visible immediately — not discovered by checking the Console.
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "csvforge-pipeline-notifications-${Environment}"
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  IAM ROLES                                                              ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+
+  # ── CodePipeline service role ─────────────────────────────────────────────
+  # Allows CodePipeline to: start CodeBuild builds, read/write the artifact bucket,
+  # use the CodeConnections GitHub connection, manage pipeline state,
+  # and send CloudWatch Events for notifications.
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "csvforge-pipeline-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # S3 artifact bucket access.
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetObjectVersion, s3:GetBucketVersioning]
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArtifactBucketName}"
+                  - !Sub "arn:aws:s3:::${ArtifactBucketName}/*"
+              # Start and monitor CodeBuild builds.
+              - Effect: Allow
+                Action: [codebuild:BatchGetBuilds, codebuild:StartBuild]
+                Resource: "*"
+              # Use the GitHub CodeConnections connection.
+              - Effect: Allow
+                Action: [codestar-connections:UseConnection]
+                Resource: !Ref GitHubConnectionArn
+              # CloudWatch Events for pipeline notifications.
+              - Effect: Allow
+                Action: [cloudwatch:*]
+                Resource: "*"
+              # SNS for approval notifications.
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref PipelineNotificationTopic
+
+  # ── Base CodeBuild role (shared policy base) ───────────────────────────────
+  # Every CodeBuild project needs: read source artifact from S3, write logs to
+  # CloudWatch, write build output to S3. These are in a base role. Project-
+  # specific permissions are added via additional inline policies below.
+  #
+  # Rather than creating 8 separate role definitions, we create one base role
+  # and attach additional policies per project. Each project references this
+  # role plus its specific permissions defined inline on the project resource.
+  # This reduces template duplication while keeping permissions distinct.
+  CodeBuildBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "csvforge-codebuild-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # ECR permissions for the worker build project.
+        # AmazonEC2ContainerRegistryPowerUser: push images, pull images, describe repos.
+        # All CodeBuild projects share this role, so all get ECR power user.
+        # In a tighter security posture, you'd create separate roles per project.
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: CodeBuildBase
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # S3: read source artifact, write build output.
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetObjectVersion]
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucketName}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucketName}"
+              # CloudWatch Logs: write build logs.
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              # CloudFormation: validate-template call in the backend test build.
+              - Effect: Allow
+                Action: [cloudformation:ValidateTemplate]
+                Resource: "*"
+              # Lambda: update-function-code, get-function-configuration.
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:GetFunctionConfiguration
+                  - lambda:GetFunction
+                  - lambda:ListEventSourceMappings
+                  - lambda:PublishVersion
+                  - lambda:WaitUntilFunctionUpdated
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:csvforge-api-${Environment}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:csvforge-worker-${Environment}"
+              # Frontend S3 bucket: sync assets.
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::csvforge-frontend-${Environment}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !Sub "arn:aws:s3:::csvforge-frontend-${Environment}"
+              # CloudFront: create invalidations.
+              - Effect: Allow
+                Action: [cloudfront:CreateInvalidation, cloudfront:GetDistribution]
+                Resource: "*"
+              # SSM Parameter Store: read /csvforge/{env}/* parameters.
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/csvforge/${Environment}/*"
+              # Secrets Manager: read DB credentials for the migrate project.
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:csvforge-db-credentials-${Environment}*"
+              # Cognito: initiate-auth for smoke test token.
+              - Effect: Allow
+                Action: [cognito-idp:InitiateAuth]
+                Resource: "*"
+              # STS: get-caller-identity (used in worker build to get account ID for ECR URI).
+              - Effect: Allow
+                Action: [sts:GetCallerIdentity]
+                Resource: "*"
+              # KMS: decrypt SecureString SSM parameters (smoke test password).
+              - Effect: Allow
+                Action: [kms:Decrypt]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  CODEBUILD PROJECTS                                                     ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  # Each project reads its buildspec from the repository source (BuildspecOverride).
+  # The buildspec path is relative to the source root. CodeBuild extracts the
+  # source artifact ZIP and reads the file at that path.
+
+  BackendTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-test-backend-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        # privileged: false — no Docker daemon needed for unit tests.
+        PrivilegedMode: false
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-test-backend.yml
+      TimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-test-backend-${Environment}"
+
+  FrontendTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-test-frontend-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-test-frontend.yml
+      TimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-test-frontend-${Environment}"
+
+  APIBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-build-api-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucketName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-build-api.yml
+      TimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-build-api-${Environment}"
+
+  WorkerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-build-worker-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        # Medium compute for Docker builds — more memory speeds up layer operations.
+        Image: aws/codebuild/standard:7.0
+        # privileged: TRUE — required to run Docker daemon inside CodeBuild.
+        # Without this, `docker build` fails with "Cannot connect to Docker daemon".
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucketName
+          - Name: ECR_REPO_NAME
+            Value: !Sub "csvforge-worker-${Environment}"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-build-worker.yml
+      TimeoutInMinutes: 20
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-build-worker-${Environment}"
+
+  APIDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-deploy-api-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: FUNCTION_NAME
+            Value: !Sub "csvforge-api-${Environment}"
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucketName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-deploy-api.yml
+      TimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-deploy-api-${Environment}"
+
+  WorkerDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-deploy-worker-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: FUNCTION_NAME
+            Value: !Sub "csvforge-worker-${Environment}"
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucketName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-deploy-worker.yml
+      TimeoutInMinutes: 15
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-deploy-worker-${Environment}"
+
+  FrontendDeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-deploy-frontend-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SSM_PREFIX
+            Value: !Sub "/csvforge/${Environment}"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-deploy-frontend.yml
+      TimeoutInMinutes: 15
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-deploy-frontend-${Environment}"
+
+  SmokeTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-smoke-test-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: SSM_PREFIX
+            Value: !Sub "/csvforge/${Environment}"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec/buildspec-smoke-test.yml
+      TimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-smoke-test-${Environment}"
+
+  # ── Separate migration project (NOT in the pipeline) ─────────────────────
+  # This project exists in the same stack but is triggered manually.
+  # VPC config allows it to reach RDS in the private subnet.
+  MigrationProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "csvforge-migrate-${Environment}"
+      ServiceRole: !GetAtt CodeBuildBaseRole.Arn
+      Artifacts:
+        # No pipeline artifact — this project is triggered standalone.
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: DEPLOY_ENVIRONMENT
+            Value: !Ref Environment
+      Source:
+        # Read buildspec from GitHub directly (not a pipeline artifact).
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubOwner}/${GitHubRepo}.git"
+        BuildSpec: buildspec/buildspec-migrate.yml
+      TimeoutInMinutes: 15
+      # VPC configuration: allows the build to reach RDS in the private subnet.
+      # The Lambda security group already has outbound TCP 5432 to RDS.
+      VpcConfig:
+        VpcId:
+          Fn::ImportValue: !Sub "csvforge-network-${Environment}-VpcId"
+        Subnets:
+          - Fn::ImportValue: !Sub "csvforge-network-${Environment}-PrivateSubnetAId"
+          - Fn::ImportValue: !Sub "csvforge-network-${Environment}-PrivateSubnetBId"
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "csvforge-network-${Environment}-LambdaSecurityGroupId"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub "/aws/codebuild/csvforge-migrate-${Environment}"
+
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║  CODEPIPELINE                                                           ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "csvforge-pipeline-${Environment}"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      # PipelineType V2 enables QUEUED execution mode.
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      # QUEUED: if a new commit arrives while the pipeline is running, it queues
+      # behind the current run. The new run starts when the current one finishes.
+      # Alternative: SUPERSEDED cancels in-progress runs when a new commit arrives.
+      # QUEUED is safer for deploy pipelines — every commit gets fully deployed.
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucketName
+
+      Stages:
+
+        # ── Stage 1: Source ────────────────────────────────────────────────────
+        # Fetches the repository at the triggering commit and stores it as a
+        # ZIP artifact named SourceArtifact in the artifact bucket.
+        # Triggered by: push to the configured branch (webhook via CodeConnections).
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepo}"
+                BranchName: !Ref GitHubBranch
+                # OutputArtifactFormat: CODEBUILD_CLONE_REF is the newer format
+                # that passes a git reference rather than a ZIP. The buildspecs
+                # can then run `git log` for the SHA. The default (CODE_ZIP)
+                # works for our use case and is simpler.
+                OutputArtifactFormat: CODE_ZIP
+                # DetectChanges: true enables the CodeConnections webhook.
+                # A push to GitHubBranch triggers the pipeline automatically.
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        # ── Stage 2: Validate and Test ─────────────────────────────────────────
+        # Both actions run IN PARALLEL (same RunOrder = 1).
+        # The stage only advances when BOTH complete successfully.
+        # A failure in either action stops the pipeline and sends a notification.
+        - Name: Test
+          Actions:
+            - Name: BackendTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref BackendTestProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+            - Name: FrontendTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref FrontendTestProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1    # same RunOrder → runs in parallel with BackendTests
+
+        # ── Stage 3: Build Artifacts ───────────────────────────────────────────
+        # All three build actions run in parallel.
+        # API build: packages the Lambda ZIP, uploads to artifact bucket.
+        # Worker build: builds Docker image, pushes to ECR.
+        # (Frontend build happens in Stage 4 because it needs SSM values.)
+        - Name: Build
+          Actions:
+            - Name: BuildAPI
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref APIBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+            - Name: BuildWorker
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref WorkerBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        # ── Stage 4: Deploy ────────────────────────────────────────────────────
+        # All three deploy actions run in parallel.
+        # API deploy: updates Lambda function code from S3 ZIP.
+        # Worker deploy: updates Lambda function code from ECR image.
+        # Frontend deploy: builds + syncs to S3 + CloudFront invalidation.
+        - Name: Deploy
+          Actions:
+            - Name: DeployAPI
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref APIDeployProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+            - Name: DeployWorker
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref WorkerDeployProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+            - Name: DeployFrontend
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref FrontendDeployProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        # ── Stage 5: Verify ────────────────────────────────────────────────────
+        # Smoke tests run AFTER all three deploys complete.
+        # Tests: /health (200), GET /jobs with auth (200), CloudFront root (200).
+        # If any test fails, the pipeline fails and no infrastructure changes happen.
+        - Name: Verify
+          Actions:
+            - Name: SmokeTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SmokeTestProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        # ── Stage 6: Infrastructure Gate ──────────────────────────────────────
+        # Manual approval required before any CloudFormation stack updates.
+        # The approver reviews the change set in the CloudFormation console
+        # and clicks Approve or Reject here.
+        # If nobody approves within 7 days, the pipeline times out.
+        - Name: InfrastructureGate
+          Actions:
+            - Name: ReviewAndApprove
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: "1"
+              Configuration:
+                NotificationArn: !Ref PipelineNotificationTopic
+                CustomData: >
+                  Review CloudFormation change sets in the AWS Console before approving.
+                  Check: csvforge-network-dev, csvforge-data-dev, csvforge-queues-dev,
+                  csvforge-api-dev, csvforge-worker-dev for pending changes.
+                  Only approve if the change sets show expected, safe changes.
+                ExternalEntityLink: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudformation/home?region=${AWS::Region}"
+              RunOrder: 1
+
+Outputs:
+  PipelineName:
+    Description: CodePipeline name. Use for monitoring and manual triggers.
+    Value: !Ref Pipeline
+
+  PipelineConsoleURL:
+    Description: Direct link to view the pipeline in the AWS Console.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view"
+
+  MigrationProjectName:
+    Description: >
+      Name of the standalone migration CodeBuild project.
+      Trigger manually: aws codebuild start-build --project-name <this value>
+    Value: !Ref MigrationProject
+
+  NotificationTopicArn:
+    Description: SNS topic ARN for pipeline notifications.
+    Value: !Ref PipelineNotificationTopic
