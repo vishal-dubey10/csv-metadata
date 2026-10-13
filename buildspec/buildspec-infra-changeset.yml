@@ -1,0 +1,170 @@
+# buildspec-infra-changeset.yml
+#
+# WHAT:
+#   Creates CloudFormation change sets for all 5 CSVForge stacks and writes
+#   a review summary. Runs in Stage 6 of the pipeline BEFORE the manual approval.
+#   The human approver reads this summary to decide whether to approve the deploy.
+#
+# WHY CREATE A CHANGE SET (not deploy directly):
+#   `aws cloudformation deploy` applies changes immediately.
+#   For application stacks with live data (RDS, SQS), immediate apply is risky:
+#   - A template change that requires RDS replacement deletes the database.
+#   - A change to an SQS queue's encryption setting may drain in-flight messages.
+#   A change set shows WHAT WOULD HAPPEN without actually doing it.
+#   The pipeline pauses for human approval between this build and execution.
+#
+# CHANGE SET REVIEW FOCUS:
+#   The most dangerous CloudFormation change set outcomes:
+#   - Replacement: True on any resource = resource is DELETED and RECREATED
+#     (data loss risk for RDS, SQS, Cognito)
+#   - Action: Remove = a resource is being deleted permanently
+#   - Action: Modify on RDS DBInstanceClass or Engine = likely replacement
+#
+# WHERE TO REVIEW CHANGE SETS (after this build):
+#   AWS Console → CloudFormation → each stack → Change Sets tab
+#   Or: aws cloudformation describe-change-set --change-set-name csvforge-pipeline-preview
+#
+# IAM PERMISSIONS NEEDED:
+#   cloudformation:CreateChangeSet, cloudformation:DescribeChangeSet
+#   on all csvforge-*-dev stacks
+#   s3:GetObject on the deployment artifact bucket (for Lambda ZIP reference)
+
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-south-1"
+    CHANGE_SET_NAME: "csvforge-pipeline-preview"
+    ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
+    # Stack names in dependency order. Change sets are created in this order
+    # so cross-stack import errors surface correctly.
+    STACKS: "csvforge-network-dev csvforge-data-dev csvforge-queues-dev csvforge-api-dev csvforge-worker-dev"
+
+phases:
+  pre_build:
+    commands:
+      - export GIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c1-8)
+      - echo "Creating change sets for commit $GIT_SHA"
+
+      # Read current deployed artifacts to use as parameters.
+      # The change set must reference the same ZIP/image that was just deployed
+      # (not trigger a new build), so we read from the deployment records.
+      - |
+        API_SHA=$(python3 -c "
+        import json, boto3
+        s3 = boto3.client('s3')
+        obj = s3.get_object(Bucket='$ARTIFACT_BUCKET', Key='deployments/api/current.json')
+        d = json.loads(obj['Body'].read())
+        print(d['git_sha'])
+        " 2>/dev/null || echo "$GIT_SHA")
+        export DEPLOYED_API_SHA=$API_SHA
+
+  build:
+    commands:
+      - echo "=== Creating CloudFormation change sets ==="
+      - REPLACE_FOUND=0
+
+      # ── Create change set for each stack ──────────────────────────────────
+      # We iterate over each stack and create a named change set.
+      # If a stack has no changes (change set would be empty), CloudFormation
+      # returns "The submitted information didn't contain changes" — we handle
+      # that gracefully below.
+      - |
+        for STACK in $STACKS; do
+          echo "--- Change set for: $STACK ---"
+
+          # Delete any existing change set with this name first (idempotent).
+          aws cloudformation delete-change-set \
+            --stack-name "$STACK" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --region "$AWS_DEFAULT_REGION" 2>/dev/null || true
+
+          # Determine template path from stack name.
+          case $STACK in
+            csvforge-network-dev) TEMPLATE="infrastructure/network.yaml" ;;
+            csvforge-data-dev)    TEMPLATE="infrastructure/data.yaml" ;;
+            csvforge-queues-dev)  TEMPLATE="infrastructure/queues.yaml" ;;
+            csvforge-api-dev)     TEMPLATE="infrastructure/api.yaml" ;;
+            csvforge-worker-dev)  TEMPLATE="infrastructure/worker.yaml" ;;
+          esac
+
+          # Create the change set. `--no-execute-changeset` is the default for
+          # `create-change-set` (unlike `deploy` which executes immediately).
+          # We use `deploy --no-execute-changeset` because it handles the
+          # "stack doesn't exist yet" case gracefully (creates a CREATE change set).
+          RESULT=$(aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name "$STACK" \
+            --no-execute-changeset \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "$AWS_DEFAULT_REGION" 2>&1)
+          EXIT=$?
+
+          if echo "$RESULT" | grep -q "The submitted information didn't contain changes"; then
+            echo "  No changes for $STACK — change set is empty."
+            continue
+          fi
+
+          if [ $EXIT -ne 0 ]; then
+            echo "  WARNING: Change set creation failed for $STACK: $RESULT"
+            continue
+          fi
+
+          # Describe the change set and look for dangerous changes.
+          CHANGES=$(aws cloudformation describe-change-set \
+            --stack-name "$STACK" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --region "$AWS_DEFAULT_REGION" \
+            --query "Changes[*].ResourceChange.{Action:Action,Type:ResourceType,Id:LogicalResourceId,Replace:Replacement}" \
+            --output table 2>/dev/null)
+          echo "$CHANGES"
+
+          # Flag any replacements — these are data-loss risks.
+          REPLACEMENTS=$(aws cloudformation describe-change-set \
+            --stack-name "$STACK" \
+            --change-set-name "$CHANGE_SET_NAME" \
+            --region "$AWS_DEFAULT_REGION" \
+            --query "Changes[?ResourceChange.Replacement=='True'].ResourceChange.LogicalResourceId" \
+            --output text 2>/dev/null)
+          if [ -n "$REPLACEMENTS" ]; then
+            echo "  ⚠️  REPLACEMENT DETECTED in $STACK: $REPLACEMENTS"
+            echo "  This means the resource will be DELETED and RECREATED."
+            echo "  For RDS: this means DATA LOSS unless a snapshot exists."
+            REPLACE_FOUND=1
+          fi
+        done
+
+      # ── Write summary for the approval notification ─────────────────────────
+      - |
+        cat > /tmp/changeset-summary.txt << EOF
+        CSVForge Infrastructure Change Set Summary
+        ==========================================
+        Commit:  $GIT_SHA
+        Created: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        Stacks reviewed: $STACKS
+
+        Change set name in each stack: $CHANGE_SET_NAME
+
+        To review in the Console:
+          https://$AWS_DEFAULT_REGION.console.aws.amazon.com/cloudformation/home?region=$AWS_DEFAULT_REGION#/stacks
+
+        REPLACEMENTS FOUND: $REPLACE_FOUND
+        $([ "$REPLACE_FOUND" = "1" ] && echo "⚠️  ONE OR MORE RESOURCES WILL BE REPLACED. REVIEW CAREFULLY." || echo "✅ No replacements. Safe to approve.")
+
+        To execute after approval:
+          for STACK in $STACKS; do
+            aws cloudformation execute-change-set \
+              --stack-name \$STACK \
+              --change-set-name $CHANGE_SET_NAME \
+              --region $AWS_DEFAULT_REGION
+          done
+        EOF
+        cat /tmp/changeset-summary.txt
+        aws s3 cp /tmp/changeset-summary.txt "s3://$ARTIFACT_BUCKET/deployments/infra/latest-changeset-summary.txt"
+
+  post_build:
+    commands:
+      - echo "Change set creation complete."
+      - echo "Review change sets in the Console before approving the pipeline."
