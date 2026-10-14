@@ -1,76 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CSVForge Data Layer — S3 bucket for CSV uploads and processed output.
-
-  WHAT THIS TEMPLATE DOES:
-    Creates the S3 bucket that stores all CSV files for CSVForge:
-      - Raw uploads from the browser (placed there by the user via presigned URL)
-      - Processed output files (placed there by the Lambda worker after cleaning)
-
-  WHY CLOUDFORMATION INSTEAD OF CLI:
-    A CloudFormation template is "infrastructure as code" — the bucket
-    configuration lives in version control alongside the application.
-    If the bucket is accidentally deleted or needs to be recreated in a
-    new region, you run one command instead of remembering multiple CLI
-    flags. CloudFormation also detects drift (manual changes that diverge
-    from the template) and can roll back failed changes atomically.
-
-  HOW TO DEPLOY:
-    aws cloudformation deploy \
-      --template-file infrastructure/data.yaml \
-      --stack-name csvforge-data-dev \
-      --region ap-south-1
-
-  HOW TO DELETE (destroys the bucket — use with caution):
-    aws cloudformation delete-stack --stack-name csvforge-data-dev --region ap-south-1
-
-  ANALOGY — S3 is a warehouse, not a filesystem:
-    Think of an S3 bucket as a massive warehouse with no shelves.
-    Every item (object) is stored flat on the floor, but each item has a
-    label (key) that can contain slashes. The slashes look like folder paths
-    but are part of the key name — there are no real directories in S3.
-    "uploads/user-1/job-abc/original.csv" is a single object key, not a
-    file inside three nested folders.
-
-    Bucket  = the warehouse building
-    Key     = the address label on each box (e.g. "uploads/user-1/job-1/original.csv")
-    Object  = the actual box (the file bytes + metadata)
-    Prefix  = the part of the key before a delimiter (like "uploads/") —
-              used for pseudo-folder filtering in list operations
-    Metadata = labels attached to the box (ContentType, custom headers)
-
-  OBJECT KEY STRUCTURE:
-    uploads/{user_id}/{job_id}/original.csv
-      ↑ raw upload from the browser via presigned PUT URL
-
-    processed/{user_id}/{job_id}/result.csv
-      ↑ cleaned output written by the Lambda worker
-
-    WHY JOB_ID IS IN THE KEY:
-      The key is deterministic. Given a job record in PostgreSQL, you always
-      know exactly where its file lives — no need to search S3.
-      It also namespaces files per job: a re-upload cannot overwrite a
-      different job's file because each job has its own unique ID prefix.
-
-  IMPORTANT CONCEPTS:
-    - S3 is object storage, NOT a POSIX filesystem. Objects cannot be
-      partially updated — you replace them entirely. There are no hard links,
-      symlinks, or file locks.
-    - Keys are UTF-8 strings up to 1024 bytes. Slashes are valid characters
-      in a key; S3 does not treat them as directory separators natively.
-    - Presigned URLs are time-limited signed requests — they grant a caller
-      temporary access to one specific operation (PUT or GET) on one specific
-      key without requiring the caller to have AWS credentials. See AD-02.
-    - Public access is blocked at every level: ACLs, bucket policies, and
-      access points. Files are only accessible via presigned URLs or IAM roles.
-
-  Interview concept:
-    "What is the difference between object storage and block storage?"
-    Block storage (EBS) presents raw disk blocks — the OS manages the filesystem,
-    file seek, partial writes. Object storage (S3) stores and retrieves complete
-    objects by key over HTTP — no partial updates, no filesystem semantics.
-    Object storage scales to exabytes because objects are stored as independent
-    units; block storage is bounded by the capacity of one disk.
+  Single bucket holds both raw uploads (uploads/ prefix) and processed results
+  (processed/ prefix). Public access blocked. SSE-S3 encryption. CORS enabled
+  for browser direct upload via presigned PUT URL (AD-02).
 
 Parameters:
   BucketName:

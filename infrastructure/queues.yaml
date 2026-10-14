@@ -1,96 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CSVForge Queue Layer — SQS main job queue and Dead-Letter Queue (DLQ).
-
-  WHAT THIS TEMPLATE DOES:
-    Creates two SQS Standard queues:
-      1. csvforge-jobs-dev-dlq  — the Dead-Letter Queue (DLQ); receives messages
-         that the Lambda worker failed to process after 5 attempts.
-      2. csvforge-jobs-dev      — the main job queue; FastAPI enqueues a message
-         here after a file is uploaded, Lambda reads messages from here.
-
-  WHY TWO QUEUES:
-    The DLQ is a safety net. When the Lambda worker crashes on a message
-    (database down, malformed CSV, unexpected exception), SQS makes the
-    message visible again after the VisibilityTimeout expires — like a job
-    ticket returning to the queue. After MaxReceiveCount (5) failed attempts,
-    SQS gives up and moves the message to the DLQ automatically. The DLQ:
-      - Prevents an unprocessable message ("poison pill") from blocking the queue.
-      - Retains failed messages for up to 4 days for investigation.
-      - Can trigger a CloudWatch alarm when messages accumulate (operational signal).
-
-  HOW TO DEPLOY:
-    aws cloudformation deploy \
-      --template-file infrastructure/queues.yaml \
-      --stack-name csvforge-queues-dev \
-      --region ap-south-1
-
-  HOW TO VIEW QUEUE ATTRIBUTES AFTER DEPLOY:
-    aws sqs get-queue-attributes \
-      --queue-url https://sqs.ap-south-1.amazonaws.com/{account}/csvforge-jobs-dev \
-      --attribute-names All \
-      --region ap-south-1
-
-  ANALOGY — SQS is a job ticket board:
-    Think of SQS as a physical job ticket board in a factory:
-    - FastAPI (the reception desk) writes a ticket and pins it to the board.
-    - The Lambda worker (factory worker) picks up a ticket, covers it with a
-      sticky note (VisibilityTimeout — "I'm working on this, don't let anyone
-      else take it"), and starts processing.
-    - On success: the worker tears up the ticket (DeleteMessage). Done.
-    - On failure: the sticky note expires (VisibilityTimeout reached), the
-      ticket becomes visible again on the board. Another worker can retry it.
-    - After 5 failures: the ticket is moved to the "failed jobs room" (DLQ)
-      for a supervisor (engineer) to investigate.
-
-  IMPORTANT CONCEPTS:
-    VisibilityTimeout:
-      When a consumer receives a message, SQS hides it from other consumers
-      for VisibilityTimeout seconds. This prevents two Lambda instances from
-      processing the same job simultaneously. The consumer must call
-      DeleteMessage before the timeout expires, or the message reappears.
-      Set this to slightly longer than the longest expected processing time
-      so a slow-but-succeeding worker isn't interrupted.
-
-    MaxReceiveCount (redrive policy):
-      After a message has been received (and NOT deleted) MaxReceiveCount
-      times, SQS considers it unprocessable and moves it to the DLQ.
-      Each failed Lambda invocation increments the receive count.
-      MaxReceiveCount=5 means 5 attempts before the DLQ.
-
-    Dead-Letter Queue (DLQ):
-      A separate queue where unprocessable messages land. The DLQ uses a
-      LONGER retention period (4 days) so engineers have time to inspect
-      the messages and understand why processing failed. A message in the
-      DLQ does NOT trigger Lambda — it sits there waiting for human review.
-      You can replay DLQ messages back to the main queue after fixing a bug.
-
-    MessageRetentionPeriod:
-      How long SQS keeps an unprocessed message before deleting it.
-      345600 seconds = 4 days. If the Lambda worker is completely down for
-      more than 4 days, messages are lost. Choose a retention window that
-      matches your operational SLA.
-
-    Standard vs FIFO queues:
-      Standard (this template): at-least-once delivery, best-effort ordering.
-        A message may occasionally be delivered more than once; receivers must
-        be idempotent (safe to process the same message twice). CSVForge uses
-        claim_job_for_processing() which is idempotent — see AD-29.
-      FIFO: exactly-once processing, strict ordering. Higher cost, lower
-        throughput (3000 msg/s vs 3000+ msg/s for Standard). Not needed for
-        CSV processing where order doesn't matter.
-
-  Interview concept:
-    "What is the SQS visibility timeout and why does it matter?"
-    The visibility timeout is the mechanism that prevents duplicate concurrent
-    processing while allowing retry on failure. Without it, if Lambda crashed
-    mid-processing, the message would disappear (deleted on receive) and the
-    job would be silently lost. With it, the message reappears after timeout
-    and another worker retries. This is the foundation of SQS's "at-least-once"
-    delivery guarantee.
-
-  See also: AD-17 in docs/DECISIONS.md for the VisibilityTimeout calculation
-  (6 × Lambda timeout of 300s = 1800s).
+  Main queue: Lambda polls and processes one message per invocation (BatchSize=1).
+  DLQ: receives messages after 5 failed processing attempts. VisibilityTimeout=1800s
+  (6x Lambda timeout of 300s) prevents duplicate concurrent processing (AD-17).
 
 Parameters:
   MainQueueName:

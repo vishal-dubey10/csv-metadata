@@ -1,75 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CSVForge Network Layer — VPC, subnets, security groups, and VPC endpoints.
-
-  WHAT THIS TEMPLATE DOES:
-    Creates the foundational network infrastructure that every other CSVForge
-    stack depends on. All Lambda functions and the RDS instance run inside
-    this VPC to prevent public internet exposure.
-
-  WHY A VPC (and not just public resources):
-    S3 and SQS are fully accessible from the internet — but RDS (PostgreSQL)
-    is NOT something you want publicly accessible. Placing RDS inside a VPC
-    with no public IP means it can only be reached by resources in the same
-    VPC (the Lambda functions). This is the standard "private database" pattern.
-
-    Placing Lambda inside the VPC also enables it to reach RDS directly over
-    private IP without a proxy — and to reach S3/SQS/Secrets Manager via VPC
-    endpoints (no internet gateway, no NAT gateway, no data transfer charges).
-
-  NETWORKING OVERVIEW:
-
-    Internet Gateway  (attached to the VPC — required for public subnets,
-                       even though we don't use public subnets for Lambda/RDS)
-          │
-    VPC (10.0.0.0/16)
-    │
-    ├── Private Subnet AZ-A (10.0.1.0/24)  — Lambda, RDS
-    │       Route table: local + S3 gateway endpoint
-    │
-    └── Private Subnet AZ-B (10.0.2.0/24)  — Lambda, RDS
-            Route table: local + S3 gateway endpoint
-
-    VPC Endpoints:
-      S3 Gateway Endpoint     — free; routes S3 traffic within AWS backbone
-      SQS Interface Endpoint  — PrivateLink; ~$0.01/hr per AZ × 2 AZs
-      Secrets Manager Endpoint— PrivateLink; ~$0.01/hr per AZ × 2 AZs
-
-    NO NAT GATEWAY:
-      Lambda reaches all AWS services via VPC endpoints. No internet egress
-      is needed, so no NAT gateway is provisioned. This saves ~$0.045/hr
-      (~$33/month) for a development environment. (AD-15)
-
-  ANALOGY — VPC as a private office building:
-    The VPC is a private office building. Subnets are floors. Security groups
-    are door locks. The internet gateway is the lobby entrance for public traffic.
-    VPC endpoints are internal corridors to AWS services — you can reach the
-    S3 "post room" or SQS "message board" without going through the lobby.
-    Lambda functions and RDS live on private floors with no public elevator.
-
-  HOW TO DEPLOY:
-    aws cloudformation deploy \
-      --template-file infrastructure/network.yaml \
-      --stack-name csvforge-network-dev \
-      --region ap-south-1
-
-  IMPORTANT CONCEPTS:
-    CIDR notation:
-      10.0.0.0/16 means: first 16 bits are fixed (10.0), last 16 bits are
-      available for hosts. Total IPs = 2^16 = 65,536. Within this VPC,
-      individual subnets use /24 notation (256 IPs each).
-    Availability Zones (AZs):
-      Independent data centres within a region. Using two AZs for subnets
-      satisfies AWS's requirement for RDS subnet groups and provides basic
-      fault tolerance for Lambda (Lambda automatically runs in multiple AZs
-      if you configure multiple subnets).
-    Security group:
-      A stateful virtual firewall for AWS resources (Lambda, RDS). "Stateful"
-      means: if you allow outbound traffic on port X, the return traffic on
-      the same connection is automatically allowed (no explicit inbound rule
-      needed for response packets).
-
-  See AD-15 in docs/DECISIONS.md for the VPC endpoint strategy.
+  Creates private networking infrastructure for Lambda and RDS. No NAT gateway —
+  Lambda reaches S3/SQS/Secrets Manager via free/low-cost VPC endpoints (AD-15).
+  Deploy first: all other stacks import Outputs from this stack.
 
 Parameters:
   VpcCidr:

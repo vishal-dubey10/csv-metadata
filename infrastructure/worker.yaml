@@ -1,71 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CSVForge Worker Layer — Worker Lambda (container image), ECR repository,
-  and SQS event source mapping.
-
-  WHAT THIS TEMPLATE DOES:
-    Creates the infrastructure that processes CSVForge jobs asynchronously:
-      1. ECR repository — stores the worker Docker image
-      2. Lambda execution role — least-privilege IAM permissions
-      3. Lambda function (container image) — the CSV processing worker
-      4. CloudWatch log group — worker logs with 14-day retention
-      5. SQS event source mapping — connects the SQS queue to Lambda
-
-  DEPENDENCY ORDERING (deploy after these stacks):
-    1. csvforge-network-dev  (VPC, subnets, security groups)
-    2. csvforge-data-dev     (S3 bucket)
-    3. csvforge-queues-dev   (SQS queue)
-    (Does NOT depend on api.yaml — see AD-26)
-
-  HOW THE WORKER PROCESSES JOBS:
-
-    FastAPI (api.yaml Lambda)
-      │ POST /uploads/{job_id}/complete
-      │ → sends SQS message: {job_id, s3_key}
-      ▼
-    SQS queue (csvforge-jobs-dev)
-      │ Event Source Mapping polls the queue
-      │ Batch size = 1 (AD-07)
-      ▼
-    Worker Lambda (this template)
-      │ lambda_handler(event, context)
-      │ → claim_job_for_processing() — atomic idempotency guard (AD-08)
-      │ → download_file(S3, original_s3_key, /tmp)
-      │ → parse_and_analyse() — validation (AD-21)
-      │ → clean() — trim + dedup
-      │ → upload_file(S3, processed_s3_key)  ← S3 before DB (AD-14)
-      │ → complete_job() / fail_job()
-      ▼
-    PostgreSQL (RDS, not in this stack — external dependency)
-
-  WHY CONTAINER IMAGE (not zip):
-    The worker has psycopg[binary] — a compiled C extension that links
-    against libpq. Binary wheels are OS/architecture specific. Building
-    inside the official Lambda base image ensures the binary is compiled
-    for the exact Amazon Linux environment Lambda runs. AD-05.
-
-  IMPORTANT COSTS:
-    ECR: $0.10/GB-month for storage.
-      A Python 3.14 Lambda image ≈ 300-500 MB → ~$0.03-0.05/month.
-    Lambda: invocations cost $0.0000166667 per GB-second.
-      1024 MB × 30s (max) = 30.72 GB-seconds ≈ $0.000512 per invocation.
-      At 100 invocations/day → ~$1.54/month.
-    ECR API calls (image push): $0.01 per 1000 GET requests → negligible.
-
-  HOW TO PUSH THE WORKER IMAGE:
-    1. Build: docker build -f worker/Dockerfile -t csvforge-worker .
-    2. Authenticate: aws ecr get-login-password --region ap-south-1 | \
-         docker login --username AWS --password-stdin \
-         <account-id>.dkr.ecr.ap-south-1.amazonaws.com
-    3. Tag: docker tag csvforge-worker \
-         <account-id>.dkr.ecr.ap-south-1.amazonaws.com/csvforge-worker-dev:<ImageTag>
-    4. Push: docker push \
-         <account-id>.dkr.ecr.ap-south-1.amazonaws.com/csvforge-worker-dev:<ImageTag>
-    5. Deploy: aws cloudformation deploy --template-file infrastructure/worker.yaml \
-         --stack-name csvforge-worker-dev --capabilities CAPABILITY_NAMED_IAM \
-         --parameter-overrides ImageTag=<ImageTag> ...
-
-  See AD-05, AD-07, AD-08, AD-14, AD-17, AD-26, AD-28 in docs/DECISIONS.md.
+  and SQS event source mapping. Worker polls SQS (BatchSize=1), claims job
+  from PostgreSQL, processes CSV, writes result to S3. Depends on network,
+  data, and queues stacks. See AD-05, AD-07, AD-08, AD-14, AD-17, AD-26.
 
 Parameters:
   NetworkStackName:
@@ -269,11 +207,8 @@ Resources:
           DB_HOST: !Ref RDSEndpoint
           DB_PORT: "5432"
           DB_NAME: csvforge
-          AWS_DEFAULT_REGION: !Ref AWS::Region
           S3_BUCKET_NAME:
             Fn::ImportValue: !Sub "${DataStackName}-BucketName"
-          # S3_OUTPUT_BUCKET falls back to S3_BUCKET_NAME if not set (AD-D2-09).
-          # Single bucket for dev — both input and output in the same bucket.
           LOG_LEVEL: INFO
       VpcConfig:
         SubnetIds:

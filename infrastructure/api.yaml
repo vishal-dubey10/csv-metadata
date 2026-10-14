@@ -1,88 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  CSVForge API Layer — API Lambda function, API Gateway HTTP API, and Cognito User Pool.
-
-  WHAT THIS TEMPLATE DOES:
-    Creates the application-layer infrastructure for the CSVForge REST API:
-      1. Cognito User Pool + App Client — user authentication
-      2. Cognito User Pool Group — admin access control
-      3. Lambda function (zip package) — hosts the FastAPI/Mangum app
-      4. Lambda IAM execution role — least-privilege permissions
-      5. API Gateway HTTP API — routes browser requests to Lambda
-      6. API Gateway JWT Authoriser — validates Cognito access tokens
-      7. Lambda permission — allows API Gateway to invoke the Lambda
-
-  DEPENDENCY ORDERING (deploy after these stacks):
-    1. csvforge-network-dev  (VPC, subnets, security groups)
-    2. csvforge-data-dev     (S3 bucket)
-    3. csvforge-queues-dev   (SQS queue)
-    This stack imports Outputs from all three stacks via Fn::ImportValue.
-
-  HOW API REQUESTS FLOW:
-
-    Browser
-      │ HTTPS request (Authorization: Bearer <access_token>)
-      ▼
-    API Gateway (HTTP API)
-      │ JWT Authoriser: validates token against Cognito JWKS
-      │   - Verifies signature
-      │   - Verifies iss = https://cognito-idp.{region}.amazonaws.com/{pool_id}
-      │   - Verifies exp (not expired)
-      │   - Verifies aud / client_id
-      │ On failure → 401 (FastAPI never runs)
-      │ On success → injects decoded claims into event.requestContext.authorizer.jwt
-      ▼
-    Lambda (API function)
-      │ Mangum translates API Gateway event → ASGI request
-      │ FastAPI reads claims from scope["aws.event"]["requestContext"]["authorizer"]["jwt"]["claims"]
-      │ get_current_user() extracts user_id from sub claim
-      ▼
-    FastAPI route handler → repository → PostgreSQL (RDS, private subnet)
-
-  AUTHENTICATION FLOW (Cognito Hosted UI or custom login):
-    1. Frontend redirects to Cognito Hosted UI (or calls InitiateAuth API).
-    2. User signs in — Cognito issues ID Token + Access Token + Refresh Token.
-    3. Frontend stores tokens in memory (not localStorage — XSS risk, AD-10).
-    4. All API requests include: Authorization: Bearer <access_token>.
-    5. API Gateway JWT Authoriser validates the access token.
-    6. FastAPI reads the validated claims from the event context.
-
-  IMPORTANT CONCEPTS:
-    HTTP API (not REST API):
-      API Gateway offers two flavors. HTTP API is the modern, lower-latency,
-      lower-cost option. REST API adds features like API keys, usage plans,
-      request validation, and transformation. For CSVForge (JWT auth, simple
-      proxy to Lambda), HTTP API is sufficient and ~70% cheaper.
-    JWT Authoriser (not Lambda Authoriser):
-      A JWT Authoriser validates tokens against a JWKS endpoint automatically —
-      no Lambda needed, no custom code. It is specifically designed for Cognito
-      (and any OIDC provider). Lambda Authorisers are for custom auth logic
-      (database lookup, API keys). For Cognito JWTs, use the JWT Authoriser.
-    Payload format version 2.0:
-      HTTP API sends events to Lambda in format 2.0. The JWT claims are at
-      event.requestContext.authorizer.jwt.claims. Mangum 0.22.0 maps this
-      to scope["aws.event"] correctly (AD-19).
-
-  COST ESTIMATES (dev environment):
-    Cognito: first 50,000 monthly active users free.
-    API Gateway HTTP API: first 300 million requests/month free (12 months),
-      then $1/million requests. Negligible for dev.
-    Lambda: first 1 million requests/month free forever. Negligible for dev.
-    RDS db.t3.micro: ~$0.017/hr ≈ $12/month. Most significant dev cost.
-
-  HOW TO DEPLOY:
-    aws cloudformation deploy \
-      --template-file infrastructure/api.yaml \
-      --stack-name csvforge-api-dev \
-      --capabilities CAPABILITY_NAMED_IAM \
-      --parameter-overrides \
-        NetworkStackName=csvforge-network-dev \
-        DataStackName=csvforge-data-dev \
-        QueuesStackName=csvforge-queues-dev \
-        LambdaZipS3Bucket=<your-deployment-bucket> \
-        LambdaZipS3Key=api/csvforge-api.zip \
-      --region ap-south-1
-
+  CSVForge API Layer — Cognito User Pool, API Gateway HTTP API, and API Lambda.
+  Browser requests hit API Gateway, JWT Authoriser validates Cognito tokens,
+  Lambda runs FastAPI via Mangum. Depends on network, data, and queues stacks.
   See AD-06, AD-19, AD-20, AD-23 in docs/DECISIONS.md.
 
 Parameters:
@@ -333,7 +253,6 @@ Resources:
           DB_HOST: !Ref RDSEndpoint
           DB_PORT: "5432"
           DB_NAME: csvforge
-          AWS_DEFAULT_REGION: !Ref AWS::Region
           S3_BUCKET_NAME:
             Fn::ImportValue: !Sub "${DataStackName}-BucketName"
           SQS_QUEUE_URL:
