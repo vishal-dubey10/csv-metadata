@@ -87,16 +87,18 @@
 
 # ── Stage: build the Lambda container image ───────────────────────────────────
 #
-# public.ecr.aws/lambda/python:3.14
-#   Official AWS Lambda base image for Python 3.14.
+# public.ecr.aws/lambda/python:3.13
+#   Official AWS Lambda base image for Python 3.13 (stable, GA release).
 #   Provides:
 #     - LAMBDA_TASK_ROOT=/var/task (where Lambda looks for handler code)
 #     - LAMBDA_RUNTIME_DIR=/var/runtime (Lambda Runtime Interface Client)
 #     - ENTRYPOINT ["/lambda-entrypoint.sh"] (starts the Lambda RIC or RIE)
 #     - CMD ["handler.lambda_handler"] (the handler — overridden below)
 #   On ECR Public so no Docker Hub rate limits apply.
-#   AD-22: Python 3.14 is the selected Lambda runtime.
-FROM public.ecr.aws/lambda/python:3.14
+#   Python 3.14 was not compatible with Lambda in ap-southeast-2; using 3.13
+#   which is the latest stable GA runtime supported across all Lambda regions.
+#   See AD-22 in docs/DECISIONS.md for runtime selection rationale.
+FROM public.ecr.aws/lambda/python:3.13
 
 # ── Layer 1: Install Python dependencies ─────────────────────────────────────
 # Copy only the requirements file first (not all source code) so this

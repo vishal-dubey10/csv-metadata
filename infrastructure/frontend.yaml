@@ -1,67 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   CSVForge Frontend — Private S3 bucket + CloudFront distribution with OAC.
-
-  WHAT THIS TEMPLATE DOES:
-    Creates the infrastructure for hosting the React single-page application:
-      1. Private S3 bucket — stores the built frontend assets (HTML, JS, CSS).
-      2. CloudFront Origin Access Control (OAC) — allows CloudFront to read
-         from the private S3 bucket without making the bucket public.
-      3. CloudFront distribution — CDN that serves the app over HTTPS from
-         edge locations worldwide.
-      4. S3 bucket policy — grants only the CloudFront distribution read access.
-
-  WHY CLOUDFRONT + PRIVATE S3 (not S3 static website hosting):
-    S3 static website hosting serves over HTTP only, from a single region.
-    CloudFront provides: HTTPS (required for Cognito tokens in localStorage),
-    global edge caching (faster page loads), DDoS protection at the CDN layer,
-    and custom error responses (needed for SPA routing — see below).
-
-  SPA ROUTING AND 404 HANDLING:
-    React Router uses browser history routing (e.g., /jobs/abc123).
-    When a user navigates directly to /jobs/abc123, their browser asks CloudFront
-    for the S3 object at that path — which doesn't exist (the object is index.html
-    at the root). S3 returns 404. Without custom error handling, the user sees a 404.
-    The fix: a CloudFront custom error response that maps 404 → 200 with index.html.
-    React Router then handles the /jobs/abc123 path client-side.
-    We also map 403 → index.html because S3 returns 403 (not 404) for missing
-    objects in a private bucket.
-
-  ORIGIN ACCESS CONTROL (OAC) vs ORIGIN ACCESS IDENTITY (OAI):
-    OAI is the older mechanism — it creates a special CloudFront user that S3 allows.
-    OAC is the current AWS recommendation — it uses SigV4 signing at the CloudFront
-    level, supports more S3 features (including SSE-KMS), and doesn't require managing
-    a separate IAM principal. Use OAC for all new distributions.
-
-  CACHING STRATEGY:
-    index.html:   Cache-Control: no-cache (always fetch fresh — it changes on deploy)
-    assets/*:     Cache-Control: max-age=31536000, immutable (cache forever — content-hashed)
-    This is handled by the S3 sync command in buildspec-deploy-frontend.yml,
-    not by CloudFront cache behaviors, for simplicity.
-
-  COST:
-    CloudFront: first 1TB/month + 10M requests free (12 months).
-      After free tier: ~$0.0085/GB + $0.0075/10K HTTPS requests.
-      For dev usage: negligible (< $1/month).
-    S3 standard storage: $0.023/GB/month.
-      A typical React build is ~2-5MB: < $0.01/month.
-    CloudFront invalidations: first 1,000 paths/month free.
-      One `/*` wildcard = one path. Dev usage stays in free tier.
-
-  HOW TO DEPLOY:
-    aws cloudformation deploy \
-      --template-file infrastructure/frontend.yaml \
-      --stack-name csvforge-frontend-dev \
-      --region ap-south-1
-
-  AFTER DEPLOY:
-    Get the CloudFront URL:
-      aws cloudformation describe-stacks \
-        --stack-name csvforge-frontend-dev \
-        --query "Stacks[0].Outputs[?OutputKey=='CloudFrontURL'].OutputValue" \
-        --output text
-    Add this URL to ALLOWED_ORIGINS in the API Lambda's environment variables.
-    Add the CloudFront distribution ID to SSM Parameter Store for the deploy buildspec.
+  React SPA assets served over HTTPS from CloudFront edge locations.
+  S3 bucket is private; only CloudFront reads it via Origin Access Control.
+  Custom error responses map 403/404 to index.html for SPA routing.
 
 Parameters:
   Environment:

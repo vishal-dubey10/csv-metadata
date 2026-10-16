@@ -35,7 +35,15 @@ Parameters:
     Description: >
       Docker image tag to deploy.
       Use a deterministic tag (e.g. git commit SHA) for reproducible deployments.
-      The deployment script (deploy_lambda.sh) passes the build ID as the tag.
+
+  ECRRepositoryUri:
+    Type: String
+    Default: "431251892391.dkr.ecr.ap-southeast-2.amazonaws.com/csvforge-worker-dev"
+    Description: >
+      Full ECR repository URI (without tag).
+      Format: <account>.dkr.ecr.<region>.amazonaws.com/<repo-name>
+      Created separately via CLI before this stack (CloudFormation cannot adopt
+      an existing resource without an explicit import operation).
 
 Resources:
 
@@ -53,46 +61,10 @@ Resources:
   # ImageScanningConfiguration:
   #   ECR can scan images for known CVEs (Common Vulnerabilities and Exposures)
   #   on push. ScanOnPush: true surfaces vulnerabilities before they reach Lambda.
-  #   Scanning is free for the first scan; subsequent scans use ECR Enhanced Scanning.
-  #
-  # LifecyclePolicy:
-  #   Automatically delete untagged images older than 7 days.
-  #   Every `docker push` creates an untagged image if the tag was moved.
-  #   Without cleanup, these orphaned layers accumulate and incur storage cost.
-  WorkerECRRepository:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: csvforge-worker-dev
-      ImageScanningConfiguration:
-        ScanOnPush: true
-      LifecyclePolicy:
-        LifecyclePolicyText: |
-          {
-            "rules": [
-              {
-                "rulePriority": 1,
-                "description": "Delete untagged images older than 7 days",
-                "selection": {
-                  "tagStatus": "untagged",
-                  "countType": "sinceImagePushed",
-                  "countUnit": "days",
-                  "countNumber": 7
-                },
-                "action": { "type": "expire" }
-              },
-              {
-                "rulePriority": 2,
-                "description": "Keep only the 5 most recent tagged images",
-                "selection": {
-                  "tagStatus": "tagged",
-                  "tagPrefixList": ["v", "sha"],
-                  "countType": "imageCountMoreThan",
-                  "countNumber": 5
-                },
-                "action": { "type": "expire" }
-              }
-            ]
-          }
+  # NOTE: The ECR repository (csvforge-worker-dev) was created manually via CLI
+  # before this stack was deployed. CloudFormation cannot adopt an existing resource
+  # without an explicit import operation, so WorkerECRRepository is intentionally
+  # omitted here. The repo URI is passed in as the ECRRepositoryUri parameter.
 
   # ── Worker Lambda Execution Role ──────────────────────────────────────────
   # Least-privilege IAM role. Permissions scoped to exact resources the
@@ -189,7 +161,7 @@ Resources:
       # CloudFormation cannot know the account ID at template-write time,
       # so we use !Sub to inject it at deploy time.
       Code:
-        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${WorkerECRRepository}:${ImageTag}"
+        ImageUri: !Sub "${ECRRepositoryUri}:${ImageTag}"
       Role: !GetAtt WorkerLambdaRole.Arn
       Timeout: 300
       MemorySize: 1024
@@ -283,7 +255,7 @@ Outputs:
         docker tag csvforge-worker <this value>:<tag>
         docker push <this value>:<tag>
       Format: <account>.dkr.ecr.<region>.amazonaws.com/<repo>
-    Value: !GetAtt WorkerECRRepository.RepositoryUri
+    Value: !Ref ECRRepositoryUri
     Export:
       Name: !Sub "${AWS::StackName}-ECRRepositoryUri"
 
