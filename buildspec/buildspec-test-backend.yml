@@ -54,7 +54,7 @@ env:
     # clutter the test output and confuse log readers.
     AWS_ACCESS_KEY_ID: "testing"
     AWS_SECRET_ACCESS_KEY: "testing"
-    AWS_DEFAULT_REGION: "ap-south-1"
+    AWS_DEFAULT_REGION: "ap-southeast-2"
     # PYTHONPATH: makes `from backend.xxx import yyy` work from the project root.
     # Without this, Python can't find the `backend` package because it's not
     # installed — it's just a directory. Adding . (the CodeBuild source root)
@@ -128,11 +128,11 @@ phases:
       # Note: validate-template does NOT check that referenced exports exist
       # (cross-stack imports are validated at deploy time, not validate time).
       - echo "Running aws cloudformation validate-template..."
-      - aws cloudformation validate-template --template-body file://infrastructure/network.yaml  --region ap-south-1
-      - aws cloudformation validate-template --template-body file://infrastructure/data.yaml     --region ap-south-1
-      - aws cloudformation validate-template --template-body file://infrastructure/queues.yaml   --region ap-south-1
-      - aws cloudformation validate-template --template-body file://infrastructure/api.yaml      --region ap-south-1
-      - aws cloudformation validate-template --template-body file://infrastructure/worker.yaml   --region ap-south-1
+      - aws cloudformation validate-template --template-body file://infrastructure/network.yaml  --region ap-southeast-2
+      - aws cloudformation validate-template --template-body file://infrastructure/data.yaml     --region ap-southeast-2
+      - aws cloudformation validate-template --template-body file://infrastructure/queues.yaml   --region ap-southeast-2
+      - aws cloudformation validate-template --template-body file://infrastructure/api.yaml      --region ap-southeast-2
+      - aws cloudformation validate-template --template-body file://infrastructure/worker.yaml   --region ap-southeast-2
       - echo "CloudFormation template validation passed."
 
   post_build:

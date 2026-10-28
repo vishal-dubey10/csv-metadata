@@ -44,7 +44,7 @@ version: 0.2
 env:
   variables:
     ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
-    AWS_DEFAULT_REGION: "ap-south-1"
+    AWS_DEFAULT_REGION: "ap-southeast-2"
 
 phases:
   install:

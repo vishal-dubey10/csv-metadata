@@ -290,7 +290,7 @@ Resources:
       CorsConfiguration:
         AllowOrigins:
           - "http://localhost:5173"
-          # Production: replace with your CloudFront or S3 static website URL.
+          - "https://d38s2v3jcf0q6l.cloudfront.net"
         AllowMethods:
           - GET
           - POST
@@ -370,6 +370,29 @@ Resources:
     Properties:
       ApiId: !Ref APIGateway
       RouteKey: "GET /health"
+      Target: !Sub "integrations/${LambdaIntegration}"
+      AuthorizationType: NONE
+
+  # ── CORS Preflight Route (no auth) ────────────────────────────────────────
+  # Browsers send an OPTIONS preflight request before any cross-origin request
+  # that carries headers (e.g. Authorization, Content-Type). The preflight
+  # itself never carries an Authorization header — so the JWT Authoriser on the
+  # DefaultRoute ($default) would reject every preflight with 401.
+  #
+  # Fix: a dedicated OPTIONS $default route with AuthorizationType: NONE.
+  # This lets all OPTIONS preflights pass through to the Lambda. FastAPI's
+  # CORSMiddleware handles them and returns the correct Access-Control-* headers.
+  #
+  # WHY NOT HANDLE CORS AT API GATEWAY LEVEL ONLY:
+  #   API Gateway's CorsConfiguration block (defined on the APIGateway resource
+  #   above) handles CORS at the gateway level. However, with a JWT Authoriser on
+  #   $default, the authoriser runs BEFORE the gateway-level CORS response for
+  #   unmatched routes. The explicit OPTIONS route bypasses this ordering issue.
+  OptionsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref APIGateway
+      RouteKey: "OPTIONS /{proxy+}"
       Target: !Sub "integrations/${LambdaIntegration}"
       AuthorizationType: NONE
 

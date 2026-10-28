@@ -1,38 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  CSVForge CI/CD Pipeline — CodePipeline orchestrating all build, test, and deploy stages.
-
-  WHAT THIS TEMPLATE CREATES:
-    1.  CodePipeline (csvforge-pipeline-dev) with 6 stages.
-    2.  IAM roles for CodePipeline and each CodeBuild project.
-    3.  CodeBuild projects for: backend tests, frontend tests, API build,
-        worker build, API deploy, worker deploy, frontend deploy, smoke tests.
-    4.  SNS topic for pipeline failure notifications.
-
-  STAGE ORDER:
-    Stage 1 — Source:     CodeConnections fetches repo at the triggering commit.
-    Stage 2 — Test:       Backend tests + cfn-lint + frontend tests (parallel).
-    Stage 3 — Build:      API ZIP + worker Docker image + frontend build (parallel).
-    Stage 4 — Deploy:     API Lambda + worker Lambda + frontend S3 (parallel).
-    Stage 5 — Verify:     Smoke tests (sequential — runs after all deploys complete).
-    Stage 6 — Infra Gate: Manual approval → CloudFormation change-set apply.
-
-  DEPLOY THIS STACK AFTER:
-    csvforge-pipeline-bootstrap-dev  (artifact bucket + GitHub connection)
-    csvforge-network-dev             (VPC exports used by migrate CodeBuild)
-    csvforge-data-dev                (S3 bucket deployed)
-    csvforge-queues-dev              (SQS deployed)
-    csvforge-api-dev                 (Cognito + API Gateway deployed)
-    csvforge-worker-dev              (ECR + worker Lambda deployed)
-    csvforge-frontend-dev            (frontend S3 + CloudFront deployed)
-
-  COST:
-    CodePipeline: $1/active pipeline/month. One pipeline = $1/month.
-    CodeBuild: first 100 build minutes/month free. After free tier:
-      general1.small = $0.005/build-minute.
-      Typical run: ~8 minutes build time = $0.04/pipeline run.
-      At 50 runs/month = $2/month + $1 pipeline = ~$3/month.
-
+  CSVForge CI/CD Pipeline — CodePipeline with 6 stages: Source, Test, Build,
+  Deploy, Verify, Infra Gate. Creates CodeBuild projects for backend tests,
+  frontend tests, API ZIP build, worker Docker build, deploys, and smoke tests.
+  Depends on csvforge-pipeline-bootstrap-dev and all application stacks.
 Parameters:
   GitHubConnectionArn:
     Type: String
@@ -149,10 +120,9 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         # ECR permissions for the worker build project.
-        # AmazonEC2ContainerRegistryPowerUser: push images, pull images, describe repos.
-        # All CodeBuild projects share this role, so all get ECR power user.
-        # In a tighter security posture, you'd create separate roles per project.
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+        # VPC networking: allows CodeBuild to run in a VPC (create/delete ENIs).
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
       Policies:
         - PolicyName: CodeBuildBase
           PolicyDocument:
@@ -186,6 +156,15 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:csvforge-api-${Environment}"
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:csvforge-worker-${Environment}"
+              # EC2: required for CodeBuild projects that run in VPC mode.
+              # CodeBuild calls DescribeSecurityGroups and DescribeSubnets to
+              # validate the VpcConfig before starting the build container.
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: "*"
               # Frontend S3 bucket: sync assets.
               - Effect: Allow
                 Action: [s3:PutObject, s3:DeleteObject, s3:GetObject]

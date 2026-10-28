@@ -33,7 +33,7 @@ version: 0.2
 
 env:
   variables:
-    AWS_DEFAULT_REGION: "ap-south-1"
+    AWS_DEFAULT_REGION: "ap-southeast-2"
     CHANGE_SET_NAME: "csvforge-pipeline-preview"
     ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
     # Stack names in dependency order. Change sets are created in this order

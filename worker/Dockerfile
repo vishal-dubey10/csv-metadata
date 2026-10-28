@@ -116,8 +116,13 @@ COPY worker/requirements.txt ${LAMBDA_TASK_ROOT}/worker-requirements.txt
 # --target=${LAMBDA_TASK_ROOT}: install packages directly into the Lambda
 #   task root rather than the default site-packages.  Lambda adds
 #   LAMBDA_TASK_ROOT to sys.path, so packages installed here are importable.
-RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/worker-requirements.txt \
-    --target ${LAMBDA_TASK_ROOT}
+#
+# NOTE: PyPI is not reachable from inside the Docker build in some environments.
+# Dependencies are pre-downloaded using `uv pip install --python-platform linux`
+# on the host machine and copied into the container as a build context.
+COPY worker/requirements.txt ${LAMBDA_TASK_ROOT}/worker-requirements.txt
+COPY worker-deps/ ${LAMBDA_TASK_ROOT}/
+# Also copy dist-info directories so importlib.metadata.version() works at runtime.
 
 # ── Layer 2: Copy backend shared modules ─────────────────────────────────────
 # The worker imports from backend.db and backend.s3_client (AD-28).
@@ -168,13 +173,17 @@ COPY backend/ ${LAMBDA_TASK_ROOT}/backend/
 #       s3_client.py
 #       sqs_client.py
 #
-# Note: we copy worker/*.py files individually to exclude worker/Dockerfile
-# itself, worker/requirements.txt (already installed), and any __pycache__.
-# Using COPY worker/ ${LAMBDA_TASK_ROOT}/ would include those files too —
-# harmless but slightly wasteful.
+# Copy worker source files into a worker/ package directory so that
+# `from worker.csv_processor import ...` in handler.py resolves correctly.
+# handler.py stays at the top level (/var/task/handler.py) because the CMD
+# references "handler.lambda_handler" — Lambda looks for handler.py in
+# LAMBDA_TASK_ROOT. The worker modules go inside /var/task/worker/ so the
+# `from worker.xxx import ...` statements in handler.py resolve.
 COPY worker/handler.py ${LAMBDA_TASK_ROOT}/handler.py
-COPY worker/csv_processor.py ${LAMBDA_TASK_ROOT}/csv_processor.py
-COPY worker/exceptions.py ${LAMBDA_TASK_ROOT}/exceptions.py
+RUN mkdir -p ${LAMBDA_TASK_ROOT}/worker
+RUN touch ${LAMBDA_TASK_ROOT}/worker/__init__.py
+COPY worker/csv_processor.py ${LAMBDA_TASK_ROOT}/worker/csv_processor.py
+COPY worker/exceptions.py ${LAMBDA_TASK_ROOT}/worker/exceptions.py
 
 # ── CMD: Lambda handler entry point ──────────────────────────────────────────
 # Format: "module_name.function_name"

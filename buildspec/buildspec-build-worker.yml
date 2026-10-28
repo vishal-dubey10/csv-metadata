@@ -6,7 +6,7 @@
 #
 # WHAT THIS BUILD PRODUCES:
 #   A Docker image pushed to ECR with two references:
-#     1. Tag:    {account}.dkr.ecr.ap-south-1.amazonaws.com/csvforge-worker-dev:{git-sha}
+#     1. Tag:    {account}.dkr.ecr.ap-southeast-2.amazonaws.com/csvforge-worker-dev:{git-sha}
 #     2. Digest: sha256:{content-hash}  (immutable — what the deploy stage uses)
 #   A metadata JSON file at s3://csvforge-pipeline-artifacts-dev/worker/latest-meta.json
 #   containing the image URI with digest for the deploy stage.
@@ -45,7 +45,7 @@ version: 0.2
 
 env:
   variables:
-    AWS_DEFAULT_REGION: "ap-south-1"
+    AWS_DEFAULT_REGION: "ap-southeast-2"
     ECR_REPO_NAME: "csvforge-worker-dev"
     ARTIFACT_BUCKET: "csvforge-pipeline-artifacts-dev"
 
