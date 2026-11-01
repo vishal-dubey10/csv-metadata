@@ -5,24 +5,24 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!--
-      Content Security Policy:
-        default-src 'self'         — only load resources from this origin by default
-        script-src 'self'          — no inline scripts (XSS mitigation)
-        style-src 'self' 'unsafe-inline'  — MUI injects inline styles via Emotion; required
-        img-src 'self' data:       — allow data: URIs for MUI icons
-        connect-src 'self' ... (filled in at deploy time based on API Gateway URL)
-      Note: 'unsafe-inline' for style-src is required by Emotion (MUI's CSS-in-JS).
-      This is a known trade-off with Emotion. Future mitigation: Pigment CSS (MUI's
-      build-time CSS alternative, currently experimental).
+      Content Security Policy.
+
+      connect-src lists each AWS endpoint explicitly.
+      CSP wildcards only match ONE subdomain level — https://*.amazonaws.com
+      does NOT cover cognito-idp.ap-southeast-2.amazonaws.com (two levels deep).
+      Each origin must be listed by full hostname to avoid silent fetch() failures
+      (the browser blocks the request without throwing a visible JS error).
+
+      Lesson learned: always test CSP in production — dev servers bypass it.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http://localhost:8000 https://*.amazonaws.com https://cognito-idp.*.amazonaws.com"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http://localhost:8000 https://wem0j5l8ad.execute-api.ap-southeast-2.amazonaws.com https://cognito-idp.ap-southeast-2.amazonaws.com https://csvforge-files-dev.s3.amazonaws.com https://csvforge-files-dev.s3.ap-southeast-2.amazonaws.com"
     />
     <title>CSVForge — CSV Processing</title>
+    <script type="module" src="/src/main.tsx"></script>
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

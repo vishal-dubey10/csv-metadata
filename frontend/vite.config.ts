@@ -29,6 +29,17 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
 
+  // ── Node.js global polyfill ───────────────────────────────────────────────
+  // amazon-cognito-identity-js references the Node.js `global` variable
+  // internally. Browsers don't have `global` — they have `window`/`globalThis`.
+  // This define replaces every occurrence of `global` in the bundle at build
+  // time with `globalThis`, which works in both browsers and Node.js environments.
+  // Without this, the app crashes at runtime with:
+  //   "ReferenceError: Can't find variable: global"
+  define: {
+    global: 'globalThis',
+  },
+
   // ── Development server ────────────────────────────────────────────────────
   // Port 5173 is the Vite default and is what the backend CORS middleware
   // whitelists as the local dev origin.
