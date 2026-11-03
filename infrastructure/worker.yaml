@@ -182,6 +182,7 @@ Resources:
           S3_BUCKET_NAME:
             Fn::ImportValue: !Sub "${DataStackName}-BucketName"
           LOG_LEVEL: INFO
+          AWS_DEFAULT_REGION: "ap-southeast-2"
       VpcConfig:
         SubnetIds:
           - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetAId"

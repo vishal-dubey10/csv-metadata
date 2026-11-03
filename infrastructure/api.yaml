@@ -258,6 +258,8 @@ Resources:
             Fn::ImportValue: !Sub "${DataStackName}-BucketName"
           SQS_QUEUE_URL:
             Fn::ImportValue: !Sub "${QueuesStackName}-MainQueueUrl"
+          ALLOWED_ORIGINS: "https://d38s2v3jcf0q6l.cloudfront.net,http://localhost:5173"
+          AWS_DEFAULT_REGION: "ap-southeast-2"
       VpcConfig:
         SubnetIds:
           - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetAId"

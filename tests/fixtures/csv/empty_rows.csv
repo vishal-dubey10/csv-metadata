@@ -1,0 +1,10 @@
+id,name,email,amount,date
+1,Alice Smith,alice@example.com,120.50,2024-01-15
+
+2,Bob Jones,bob@example.com,85.00,2024-01-16
+
+
+3,Carol White,carol@example.com,200.75,2024-01-17
+4,David Brown,david@example.com,50.00,2024-01-18
+
+5,Eve Davis,eve@example.com,310.25,2024-01-19
