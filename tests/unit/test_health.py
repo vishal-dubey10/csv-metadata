@@ -4,30 +4,46 @@ Unit tests for the /health endpoint.
 These tests use FastAPI's TestClient — no real HTTP server, no database.
 The app is run in-process via the ASGI interface.
 
-HOW TestClient WORKS:
-`TestClient` (from Starlette/FastAPI) makes HTTP requests to the FastAPI app
-WITHOUT starting a real HTTP server. Requests go through Python's call stack
-directly — no network, no port binding. This means tests run fast and don't
-need OS-level cleanup. The `response` object behaves exactly like a
-`requests.Response` — it has `.status_code`, `.json()`, `.headers`, etc.
+WHAT THESE TESTS VERIFY:
+    - GET /health returns HTTP 200
+    - The response body contains {"status": "ok"} and an "environment" field
+    - The environment field reflects the ENVIRONMENT env variable (set to "local" in tests)
+    - The response content-type is application/json
+    - The response body has exactly the expected keys (no leaked internal data)
 
-`response.json()` parses the response body as JSON and returns a Python
-dict/list. No network deserialization overhead — the response was never
-actually bytes-over-a-wire; it's already a Python object internally. The
-`.json()` call is still used for consistency with real HTTP client code.
+WHY TEST THE HEALTH ENDPOINT?
+    Health checks are the first line of defence against broken deployments.
+    Load balancers, ECS task definitions, and Kubernetes liveness probes poll
+    /health to decide whether to route traffic to this instance. If /health
+    is broken, the entire service appears dead to the load balancer.
+    Testing /health verifies that: imports succeed (no circular import), the
+    ASGI app starts up, and the environment variable is read correctly.
+
+HOW TestClient WORKS:
+    `TestClient` (from Starlette/FastAPI) makes HTTP requests to the FastAPI app
+    WITHOUT starting a real HTTP server. Requests go through Python's call stack
+    directly — no network, no port binding. This means tests run fast and don't
+    need OS-level cleanup. The `response` object behaves exactly like a
+    `requests.Response` — it has `.status_code`, `.json()`, `.headers`, etc.
+
+    `response.json()` parses the response body as JSON and returns a Python
+    dict/list. No network deserialization overhead — the response was never
+    actually bytes-over-a-wire; it's already a Python object internally. The
+    `.json()` call is still used for consistency with real HTTP client code.
 
 FIXTURE INJECTION:
-The `client` fixture is defined in `tests/conftest.py`. pytest automatically
-discovers fixtures from conftest.py files in parent directories. When a test
-declares `client` as a parameter, pytest finds and calls the `client` fixture
-from conftest.py, which creates a `TestClient(app)` and yields it. This is
-pytest's dependency injection system for test fixtures.
+    The `client` fixture is defined in `tests/conftest.py`. pytest automatically
+    discovers fixtures from conftest.py files in parent directories. When a test
+    declares `client` as a parameter, pytest finds and calls the `client` fixture
+    from conftest.py, which creates a `TestClient(app)` and yields it. This is
+    pytest's dependency injection system for test fixtures.
 
-What these tests verify:
-- GET /health returns HTTP 200
-- The response body contains status and environment fields
-- The environment field reflects the ENVIRONMENT env variable
-- The endpoint is reachable (no import errors, no startup crash)
+GATE CS CONCEPT — Integration testing vs unit testing:
+    These are unit tests for the API layer — the database is not involved.
+    FastAPI's TestClient allows "integration-light" testing: the full HTTP
+    request/response cycle runs (CORS middleware, routing, serialization)
+    but no real network or database is used. This is a middle ground between
+    pure unit tests (mocking everything) and full integration tests (real infra).
 """
 
 import os

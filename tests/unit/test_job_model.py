@@ -5,33 +5,48 @@ These tests verify the structure of the model — column count, enum values,
 constraints — without connecting to any database. They are pure Python
 introspection tests.
 
-Why test model structure?
-- A missing column is caught before it causes a runtime error in a route.
-- If someone adds a column and forgets to update the migration, these tests
-  catch the discrepancy (the model has 16 columns but the migration creates 15).
-- Enums are the documented API contract: the exact string values must match
-  what the database stores.
+WHY TEST MODEL STRUCTURE?
+    A missing column is caught before it causes a runtime error in a route.
+    If someone adds a column and forgets to update the migration, these tests
+    catch the discrepancy (the model has 16 columns but the migration creates 15).
+    Enums are the documented API contract: the exact string values must match
+    what the database stores and what the frontend expects.
 
 HOW SQLAlchemy INTROSPECTION WORKS:
-`sa_inspect(Job)` returns a SQLAlchemy Mapper object that exposes the ORM
-mapping for the `Job` class — its mapped columns, relationships, primary keys,
-etc. This is SQLAlchemy's introspection API: instead of reading the `Job` class
-definition manually, the test uses the SQLAlchemy API to verify that the
-mapping was set up correctly. Useful for verifying that `mapped_column()` was
-called with the right arguments.
+    `sa_inspect(Job)` returns a SQLAlchemy Mapper object that exposes the ORM
+    mapping for the `Job` class — its mapped columns, relationships, primary keys,
+    etc. This is SQLAlchemy's reflection/introspection API: instead of reading the
+    `Job` class definition manually, the test uses the SQLAlchemy API to verify
+    that the mapping was set up correctly.
 
-`Job.__table__` accesses the underlying SQLAlchemy `Table` object that was
-created when `Job` was defined. `Job.__table__.columns` (also accessible as
-`Job.__table__.c`) is a mapping of column name to `Column` object. This lets
-tests inspect column types, nullability, defaults, and constraints
-programmatically — without querying the actual database.
+    `Job.__table__` accesses the underlying SQLAlchemy `Table` object that was
+    created when `Job` was defined. `Job.__table__.columns` (also accessible as
+    `Job.__table__.c`) is a mapping of column name to `Column` object. This lets
+    tests inspect column types, nullability, defaults, and constraints
+    programmatically — without querying the actual database.
 
-`col.onupdate` is a Python-layer property, not a database-level property — it
-is stored on the Python `Column` object in SQLAlchemy's in-memory
-representation. Checking `col.onupdate is not None` verifies that SQLAlchemy
-will add the `onupdate` expression to UPDATE statements. This does NOT test
-database trigger behavior (there is none) — it tests that the ORM-level
-behavior is configured correctly.
+    `col.onupdate` is a Python-layer property, not a database-level property — it
+    is stored on the Python `Column` object in SQLAlchemy's in-memory
+    representation. Checking `col.onupdate is not None` verifies that SQLAlchemy
+    will add the `onupdate` expression to UPDATE statements. This does NOT test
+    database trigger behavior (there is none) — it tests that the ORM-level
+    behavior is configured correctly.
+
+WHAT WOULD FAIL IF THESE TESTS BREAK?
+    test_has_exactly_15_columns: someone added/removed a column without updating
+        both the model AND the migration.
+    test_all_expected_values_present: a status string was renamed — the database
+        stores 'queued' but the enum changed to 'in_queue'.
+    test_updated_at_has_onupdate: the ORM won't auto-update the timestamp on
+        status transitions — every job would show the creation time as "last updated."
+    test_has_three_indexes: a query that was fast (index scan) is now slow (table scan).
+
+GATE CS CONCEPT — Database design, normalization, constraints:
+    The nullable vs non-nullable column tests reflect a fundamental DB design
+    principle: NOT NULL constraints enforce referential integrity at the schema
+    level. A job without a user_id violates the application's data model —
+    making the column NOT NULL catches this at INSERT time, not at query time.
+    This is "enforcing invariants as close to the data as possible."
 """
 
 import pytest

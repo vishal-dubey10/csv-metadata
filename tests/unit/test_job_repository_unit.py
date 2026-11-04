@@ -4,24 +4,59 @@ Unit tests for the job repository — SQLite in-memory backend.
 These tests exercise repository logic that doesn't require PostgreSQL-specific
 features (ARRAY columns, TIMESTAMPTZ precision). They run without Docker.
 
-What's tested here:
-- create_job returns a Job with all required fields populated
-- get_job_by_id returns None for missing ids
-- get_job_by_id_and_user enforces ownership (returns None for wrong user)
-- list_jobs_for_user excludes pending_upload rows
-- transition_to_queued returns False when status is wrong or user mismatches
-- claim_job_for_processing returns False on completed/failed jobs
-- fail_job then claim_job_for_processing returns False (terminal state)
+WHAT'S TESTED HERE:
+    - create_job:                returns a Job with all required fields populated
+    - get_job_by_id:             returns None for missing ids (no exception raised)
+    - get_job_by_id_and_user:    enforces ownership (returns None for wrong user)
+    - list_jobs_for_user:        excludes pending_upload rows (AD-13)
+    - transition_to_queued:      returns False when status is wrong or user mismatches
+    - claim_job_for_processing:  returns False on completed/failed jobs (terminal state)
+    - test_second_claim_returns_false: intentionally named to document surprising behavior
+    - fail_job:                  sets status=failed and stores failure_reason
 
-What's NOT tested here (requires real PostgreSQL — see integration tests):
-- column_names ARRAY storage and retrieval
-- TIMESTAMPTZ precision and updated_at > created_at verification
-- Alembic migration schema verification
-- Concurrent claim behavior
+WHAT'S NOT TESTED HERE (requires real PostgreSQL — see integration tests):
+    - column_names ARRAY storage and retrieval
+    - TIMESTAMPTZ precision and updated_at > created_at verification
+    - Alembic migration schema verification
+    - Concurrent claim behavior (MVCC)
 
-Note on SQLite compatibility:
-SQLite doesn't enforce VARCHAR length limits or support ARRAY, but it handles
-the basic ORM operations we need for structural unit tests.
+WHY SQLITE FOR UNIT TESTS?
+    SQLite is an embedded database — no server process, no network, no Docker.
+    Tests start in milliseconds. The trade-off: SQLite doesn't enforce VARCHAR
+    length limits, doesn't support ARRAY or TIMESTAMPTZ, and has different
+    locking behavior (file-level vs row-level). Unit tests use it for speed;
+    integration tests use real PostgreSQL for correctness.
+
+    See: connection.py's `_is_postgres` branch and the with_variant() explanation
+    in models/job.py for how the codebase handles this two-database reality.
+
+ARCHITECTURE OF A REPOSITORY TEST:
+    1. Set up: create a job in the SQLite test DB using _make_job().
+    2. Act:    call the repository function under test.
+    3. Assert: verify the returned value AND (for writes) re-fetch from DB to
+               verify the change was persisted.
+
+    The "re-fetch after write" pattern is important: it verifies that the
+    change reached the database, not just that the Python object was mutated.
+    Without it, you'd be testing SQLAlchemy's in-memory state, not the DB.
+
+GATE CS CONCEPT — Test isolation and the transaction model:
+    The `sqlite_db` fixture (conftest.py) calls `Base.metadata.create_all()`
+    before each test and `drop_all()` after. This gives each test a completely
+    fresh schema — no leftover rows from earlier tests can cause false positives
+    or cascade failures. This is a key testing principle: each test should be
+    independent of every other test's side effects.
+
+    The `db.commit()` calls in _make_job() and individual tests reflect the
+    transaction model: changes are not visible to new queries until committed.
+    Testing this behavior teaches the Unit of Work pattern (see connection.py).
+
+NOTE on test_second_claim_returns_false:
+    The test name suggests the second claim should return False. The assertion
+    shows it returns True. This intentional mismatch is documented in the test
+    body and teaches a subtle idempotency concept. Do NOT rename this test.
+    See its docstring and the claim_job_for_processing docstring for the full
+    explanation of why both claims return True (the 'processing' IN clause).
 """
 
 import pytest

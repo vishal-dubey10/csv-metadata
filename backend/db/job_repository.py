@@ -4,6 +4,30 @@ CSVForge — Job repository.
 All database operations for the `jobs` table live here.
 Routes and the worker import these functions; they never write raw queries.
 
+WHAT:
+    - create_job()               — INSERT a new job row (status: pending_upload)
+    - get_job_by_id()            — SELECT by primary key (admin / worker access)
+    - get_job_by_id_and_user()   — SELECT by primary key + user_id (ownership-enforced)
+    - list_jobs_for_user()       — SELECT visible jobs for a user (excludes pending_upload)
+    - list_all_jobs()            — SELECT all jobs (admin, paginated)
+    - count_all_jobs()           — COUNT all jobs (admin, for Content-Range header)
+    - transition_to_queued()     — UPDATE pending_upload → queued (upload confirmed)
+    - claim_job_for_processing() — UPDATE queued/processing → processing (worker claims)
+    - complete_job()             — UPDATE processing → completed (worker done)
+    - fail_job()                 — UPDATE any status → failed (permanent error)
+
+WHY:
+    job_repository.py is a "repository" — it encapsulates ALL database access
+    for Job objects behind plain Python functions. The API layer (main.py)
+    never writes SQL; it calls these functions instead.
+
+    This separates concerns: if you switch from PostgreSQL to DynamoDB, you
+    only change job_repository.py. Every other file stays the same.
+
+    Contrast this with the Active Record pattern (used by Django ORM) where
+    the model itself has `.save()`, `.delete()`, etc. — logic and data are
+    merged. Repository keeps them separate.
+
 ARCHITECTURE — where this file sits in the request stack:
 
     HTTP Request
@@ -17,18 +41,6 @@ ARCHITECTURE — where this file sits in the request stack:
     SQLAlchemy ORM
         │
     PostgreSQL database
-
-REPOSITORY PATTERN:
-    job_repository.py is a "repository" — it encapsulates ALL database access
-    for Job objects behind plain Python functions. The API layer (main.py)
-    never writes SQL; it calls these functions instead.
-
-    This separates concerns: if you switch from PostgreSQL to DynamoDB, you
-    only change job_repository.py. Every other file stays the same.
-
-    Contrast this with the Active Record pattern (used by Django ORM) where
-    the model itself has `.save()`, `.delete()`, etc. — logic and data are
-    merged. Repository keeps them separate.
 
 SQLALCHEMY 2.0 RESULT CHAIN:
     Most read functions use this chain:
@@ -49,15 +61,43 @@ SQLALCHEMY 2.0 RESULT CHAIN:
     The new style separates query construction (select()) from execution
     (db.execute()) — cleaner, more composable, and works with Core + ORM alike.
 
+IMPORTANT CONCEPTS:
+    Repository pattern:
+        A design pattern where all data-access logic for one entity lives in one
+        class or module. Routes call repository functions; they never write SQL.
+        Benefit: swap the database backend by changing one file.
+    Conditional UPDATE (vs SELECT FOR UPDATE):
+        Used in claim_job_for_processing. Checks the condition AND performs the
+        update atomically in ONE SQL statement. No explicit row lock needed.
+        rowcount=0 means "condition was false — another worker got here first."
+    Identity map:
+        SQLAlchemy's Session keeps an in-memory cache of loaded ORM objects.
+        After bulk UPDATEs (Core SQL, not ORM), the cache can be stale.
+        db.expire_all() forces a fresh SELECT on the next attribute access.
+    synchronize_session modes:
+        "evaluate": SQLAlchemy re-evaluates the WHERE clause in Python to update
+                    in-memory objects. Safe for simple equality conditions.
+        False:      SQLAlchemy skips in-memory updates. Requires db.expire_all()
+                    to prevent stale reads. Used for complex WHERE clauses.
+
 Design principles:
-- Every function accepts `db: Session` as its first argument.
-  The caller (route or worker) owns the session lifecycle.
-- All writes use SQLAlchemy ORM operations — no raw text() with
-  string interpolation (SQL injection protection).
-- Functions return None or bool rather than raising on "not found" —
-  callers decide how to handle missing/unauthorized resources.
-- `claim_job_for_processing` uses a conditional UPDATE (not SELECT FOR UPDATE)
-  for lock-free idempotency. See function docstring for the race-condition analysis.
+    - Every function accepts `db: Session` as its first argument.
+      The caller (route or worker) owns the session lifecycle.
+    - All writes use SQLAlchemy ORM operations — no raw text() with
+      string interpolation (SQL injection protection).
+    - Functions return None or bool rather than raising on "not found" —
+      callers decide how to handle missing/unauthorized resources.
+    - `claim_job_for_processing` uses a conditional UPDATE (not SELECT FOR UPDATE)
+      for lock-free idempotency. See function docstring for the race-condition analysis.
+
+Interview concept:
+    "What is the Repository pattern and why use it?"
+    The repository pattern decouples business logic from data access.
+    Routes ask for domain objects (Jobs); they don't know or care whether
+    the data comes from PostgreSQL, DynamoDB, or a test stub.
+    Contrast: Active Record (Django models) couples data and logic together —
+    your model object has .save(), .delete(), .filter() — convenient but harder
+    to swap implementations.
 
 References: design.md §5.2, tasks.md T-04, AD-08
 """
@@ -220,12 +260,41 @@ def list_all_jobs(
     """
     List all jobs for the admin view, with optional status filtering.
 
-    Supports React Admin's ra-data-simple-rest pagination convention
-    (_start/_end parameters map to skip/limit). Returns jobs for ALL users.
+    WHAT:
+        Returns a paginated slice of ALL jobs across ALL users, ordered
+        newest-first. Used by the GET /admin/jobs endpoint with React Admin.
 
-    skip:          number of rows to skip (offset)
-    limit:         maximum rows to return
-    status_filter: if provided, filter to this status value only
+    WHY PAGINATION (skip/limit):
+        Without pagination, a large jobs table would load every row into
+        memory on each admin page load. skip/limit (SQL OFFSET/LIMIT) allows
+        loading only the current page. React Admin's ra-data-simple-rest
+        convention maps _start/_end query params to skip/limit.
+
+        Example: _start=0, _end=10 → skip=0, limit=10 → rows 0–9.
+
+    HOW (execution order):
+        1. Build a base SELECT * FROM jobs statement.
+        2. If status_filter is provided, add WHERE status = status_filter.
+        3. Add ORDER BY created_at DESC (newest first, consistent ordering).
+        4. Add OFFSET skip LIMIT limit.
+        5. Execute and return the list of Job objects.
+
+    Inputs:
+        db:            Active SQLAlchemy session.
+        skip:          Number of rows to skip (SQL OFFSET). Default: 0.
+        limit:         Maximum rows to return (SQL LIMIT). Default: 25.
+        status_filter: If set, only return jobs with this status value.
+                       e.g. "failed" → admin sees only failed jobs.
+                       If None, returns all statuses.
+
+    Output:
+        List of Job ORM objects (may be empty).
+
+    Side effects:
+        One SELECT query to PostgreSQL.
+
+    See also: count_all_jobs() for the total row count (Content-Range header).
+    See also: list_jobs_for_user() for the user-facing version (ownership-filtered).
     """
     stmt = select(Job)
     if status_filter:
@@ -241,15 +310,40 @@ def count_all_jobs(
     """
     Count total jobs for the admin view (used for Content-Range header).
 
-    React Admin's ra-data-simple-rest provider reads the Content-Range header
-    to know the total count for pagination: `Content-Range: jobs 0-24/150`.
-    This function provides the total (the `150` part).
+    WHAT:
+        Issues a SELECT COUNT(id) FROM jobs (optionally filtered by status)
+        and returns the integer count.
 
-    `from sqlalchemy import func as sa_func` is a local import (inside the
-    function body rather than at the top of the file). This avoids a name
-    collision: `func` is a common variable name in Python, and importing
-    it at module level could shadow it accidentally. Aliasing to `sa_func`
-    makes it clear this is the SQLAlchemy function expression helper.
+    WHY:
+        React Admin's ra-data-simple-rest provider reads the HTTP
+        `Content-Range: jobs 0-24/150` header to determine total pages.
+        The `150` part requires a separate COUNT query because the list
+        query uses LIMIT — it cannot tell you how many total rows exist.
+        This function provides that total count.
+
+    WHY LOCAL IMPORT (from sqlalchemy import func as sa_func):
+        `func` is a common Python variable name. Importing it at module level
+        as `func` would risk shadowing it if someone adds a local variable
+        named `func` in this file. Aliasing to `sa_func` in a local import
+        makes it unambiguous that this is the SQLAlchemy function expression
+        helper (used for COUNT, NOW, etc.). The local import is a style choice
+        to avoid a potential name collision, not a performance consideration.
+
+    HOW (execution order):
+        1. Build SELECT COUNT(jobs.id) FROM jobs.
+        2. Add WHERE status = status_filter if provided.
+        3. Execute and return the integer.
+
+    Inputs:
+        db:            Active SQLAlchemy session.
+        status_filter: Optional status string. Must match list_all_jobs() filter
+                       for the Content-Range total to be accurate.
+
+    Output:
+        Integer count of matching jobs. Returns 0 if the table is empty.
+
+    Side effects:
+        One SELECT COUNT query to PostgreSQL.
     """
     from sqlalchemy import func as sa_func
     stmt = select(sa_func.count(Job.id))
@@ -476,12 +570,46 @@ def complete_job(
     """
     Mark a job as completed and store all processing results.
 
-    Called by the worker after successfully writing the processed file to S3.
-    The S3 write happens BEFORE this call so that if this DB update fails,
-    the retry can safely overwrite the same deterministic S3 key. (AD-14)
+    WHAT:
+        Issues a single UPDATE that atomically transitions status to 'completed'
+        and writes all processing results (S3 key, row count, column names, etc.)
+        in one database round-trip.
 
-    All result fields are written in a single UPDATE statement —
-    one round-trip to the database.
+    WHY WRITE ALL RESULTS IN ONE UPDATE:
+        Writing each result column separately would require multiple UPDATE
+        statements and multiple round-trips. A multi-column UPDATE is atomic —
+        all fields are set together in one SQL statement. If the update fails
+        midway, no partial state is written to the database.
+
+    WHY S3 WRITE COMES BEFORE THIS CALL (AD-14):
+        The worker writes the processed CSV to S3 BEFORE calling complete_job().
+        If the DB update fails, the worker can safely retry — it will
+        overwrite the same deterministic S3 key (processed/{user_id}/{job_id}/result.csv).
+        If S3 write happens after the DB update, a S3 failure would leave the
+        DB showing 'completed' but no file available — a broken state.
+
+    HOW (execution order):
+        1. Build an UPDATE jobs SET ... WHERE id = job_id statement.
+        2. Set status='completed' and all result fields.
+        3. Execute with synchronize_session=False (complex multi-column update).
+        4. Call db.expire_all() to clear the identity map (see claim_job_for_processing
+           docstring for the full explanation of why expire_all is needed).
+
+    Inputs:
+        db:                    Active SQLAlchemy session.
+        job_id:                The job UUID to update.
+        processed_s3_key:      S3 key where the cleaned CSV output was written.
+        file_size_bytes:       Actual uploaded file size (from S3 HeadObject).
+        row_count:             Number of data rows in the processed CSV.
+        column_count:          Number of columns.
+        column_names:          List of column header names, in order.
+        duplicate_rows_removed: Count of duplicate rows removed during cleaning.
+
+    Output:
+        None. Raises on database error.
+
+    Side effects:
+        One UPDATE to PostgreSQL. Calls db.expire_all() to clear stale cache.
     """
     stmt = (
         update(Job)
@@ -505,17 +633,50 @@ def fail_job(db: Session, job_id: str, failure_reason: str) -> None:
     """
     Mark a job as permanently failed with a human-readable reason.
 
-    Called by the worker when it encounters a permanent validation error
-    (e.g., invalid CSV encoding, duplicate headers — see AD-21).
+    WHAT:
+        Issues a single UPDATE that transitions status to 'failed' and records
+        a failure_reason string explaining what went wrong.
 
-    The worker does NOT raise an exception after calling this function.
-    Raising would cause SQS to retry the message, but the file is permanently
-    invalid — retrying would loop forever. Setting status=failed and returning
-    successfully tells SQS to delete the message. The failure is surfaced
-    to the user through the job status API.
+    WHY NOT RAISE AN EXCEPTION (fail silently from SQS's perspective):
+        The worker calls fail_job() when it encounters a permanent validation
+        error (e.g., invalid CSV encoding, duplicate column headers).
 
-    Also called on unrecoverable infrastructure errors where retrying would
-    be harmful (e.g., job is already in a terminal state).
+        If the worker raised an exception AFTER calling fail_job(), SQS would
+        interpret the Lambda failure as a retriable error and re-deliver the
+        same message. The file is permanently invalid — retrying would loop
+        forever until the message lands in the DLQ.
+
+        By calling fail_job() and returning normally:
+        - The Lambda function returns successfully.
+        - SQS deletes the message from the queue (delivery confirmed).
+        - The failure is surfaced to the user via the GET /jobs/{job_id} endpoint.
+        - No infinite retry loop.
+
+    WHY PERMANENT (not "try again later"):
+        fail_job() is for errors that will never succeed on retry:
+        - Invalid CSV encoding (the file bytes are corrupt)
+        - Duplicate column headers (a structural problem in the file)
+        - Missing required columns (validation failure)
+        For transient errors (DB temporarily unreachable, S3 throttle), the
+        worker raises an exception to trigger SQS retry instead.
+
+    HOW (execution order):
+        1. Build UPDATE jobs SET status='failed', failure_reason=... WHERE id=job_id.
+        2. Execute with synchronize_session=False.
+        3. Call db.expire_all() to clear the identity map.
+
+    Inputs:
+        db:             Active SQLAlchemy session.
+        job_id:         The job UUID to mark as failed.
+        failure_reason: Human-readable explanation for the user
+                        (e.g., "Invalid CSV: duplicate column name 'id'").
+                        This is shown to the user in the job status response.
+
+    Output:
+        None. Raises on database error.
+
+    Side effects:
+        One UPDATE to PostgreSQL. Calls db.expire_all().
     """
     stmt = (
         update(Job)

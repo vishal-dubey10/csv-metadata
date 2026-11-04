@@ -250,17 +250,18 @@ class JobResponse(BaseModel):
     updated_at: Optional[str] = None   # ISO-8601 string
 
     model_config = {"from_attributes": True}
-    """
-    from_attributes=True enables Pydantic to populate this model from a
-    SQLAlchemy ORM object (Job) by reading attributes, not just dict keys.
-
-    Without this, `JobResponse.model_validate(job_orm_object)` would fail
-    because Pydantic would try to call job["job_id"] (dict access) instead
-    of job.job_id (attribute access). Setting from_attributes=True enables
-    the ORM-to-schema bridge.
-
-    This is equivalent to Pydantic v1's `class Config: orm_mode = True`.
-    """
+    # from_attributes=True enables Pydantic to populate this model from a
+    # SQLAlchemy ORM object (Job) by reading attributes, not just dict keys.
+    #
+    # Without this, `JobResponse.model_validate(job_orm_object)` would fail
+    # because Pydantic would try to call job["job_id"] (dict access) instead
+    # of job.job_id (attribute access). Setting from_attributes=True enables
+    # the ORM-to-schema bridge.
+    #
+    # This is equivalent to Pydantic v1's `class Config: orm_mode = True`.
+    # The rename from `orm_mode` to `from_attributes` reflects Pydantic v2's
+    # philosophy: the feature is not ORM-specific — it works with any object
+    # that exposes data as attributes (dataclasses, NamedTuples, etc.).
 
 
 class JobListResponse(BaseModel):
