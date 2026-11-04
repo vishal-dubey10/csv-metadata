@@ -1,5 +1,28 @@
 # CSVForge Documentation Pass Report
 
+---
+
+## MENTAL_MAP.md Rewrite — Completion Note
+
+**Task completed:** Full rewrite of `docs/MENTAL_MAP.md`.
+
+**What was written:**
+- Section 1: Project overview (5 sentences, end-to-end flow)
+- Section 2: Architecture diagram (ASCII, arrow-by-arrow table)
+- Section 3: File index — all 18 files read; every public function/class indexed with one-line descriptions and jump-to docstring pointers
+- Section 4: Concept map — 40+ concepts mapped to exact file + symbol + brief explanation
+- Section 5: GATE 2027 CS syllabus mapping — 8 areas (Databases, OS, Computer Networks, DS&A, Algorithms, Theory of Computation, Software Engineering, Cloud/Distributed Systems) with topic/sub-topic/concept/file/how columns
+- Section 6: Learning path — 19-step reading order with rationale per step
+- Appendix: Quick command reference
+
+**GATE 2027 source:** Topics confirmed from IIT Madras's released 2027 syllabus via Made Easy and GeeksForGeeks (2025 publications). Content rephrased for licensing compliance.
+
+**Tests after change:** `PYTHONPATH=. .venv/bin/pytest tests/unit/ -v` → **197 passed in 3.38s**. No Python files modified.
+
+**Commit:** `3877bc2` — `docs: fully rewrite MENTAL_MAP.md with file index, concept map, GATE 2027 syllabus mapping, and learning path`
+
+---
+
 ## Final Test Result
 
 ```
