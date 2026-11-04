@@ -182,7 +182,8 @@ Resources:
           S3_BUCKET_NAME:
             Fn::ImportValue: !Sub "${DataStackName}-BucketName"
           LOG_LEVEL: INFO
-          AWS_DEFAULT_REGION: "ap-southeast-2"
+          # AWS_DEFAULT_REGION is reserved by Lambda and auto-set to the function's
+          # own region (ap-southeast-2) — cannot be overridden via env vars.
       VpcConfig:
         SubnetIds:
           - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetAId"

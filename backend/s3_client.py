@@ -114,7 +114,7 @@ def get_s3_client():
         credentials explicitly.
 
     HOW (execution order):
-        1. Read AWS_DEFAULT_REGION from the environment (default: ap-south-1).
+        1. Read AWS_DEFAULT_REGION from the environment (default: ap-southeast-2).
         2. Read AWS_ENDPOINT_URL from the environment (optional — only for
            LocalStack or S3-compatible stores).
         3. Call boto3.client("s3", ...) with region and optional endpoint_url.
@@ -134,7 +134,7 @@ def get_s3_client():
         The handset itself costs almost nothing; the phone call (network) is the
         expensive part.
     """
-    region = os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
+    region = os.getenv("AWS_DEFAULT_REGION", "ap-southeast-2")
 
     # AWS_ENDPOINT_URL allows redirecting all boto3 calls to a local emulator
     # like LocalStack. When this variable is unset (the normal case), boto3

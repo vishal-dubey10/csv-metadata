@@ -259,7 +259,8 @@ Resources:
           SQS_QUEUE_URL:
             Fn::ImportValue: !Sub "${QueuesStackName}-MainQueueUrl"
           ALLOWED_ORIGINS: "https://d38s2v3jcf0q6l.cloudfront.net,http://localhost:5173"
-          AWS_DEFAULT_REGION: "ap-southeast-2"
+          # AWS_DEFAULT_REGION is reserved by Lambda and auto-set to the function's
+          # own region (ap-southeast-2) — cannot be overridden via env vars.
       VpcConfig:
         SubnetIds:
           - Fn::ImportValue: !Sub "${NetworkStackName}-PrivateSubnetAId"
